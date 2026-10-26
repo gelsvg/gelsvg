@@ -179,19 +179,32 @@ def _kept_image(panel: Panel) -> None:
                          "Draw it again and pass the pixels as Content.rendered.", panel.index)
 
 
-def _kept_image_png(panel: Panel, itxt: bytes, gels: bytes) -> bytes:
+@dataclass
+class _Kept:
+    """A rendered image kept as it was: its PNG, and the figure record that
+    goes with it. `legacy` also drops an old MyWB carrier's data."""
+
+    png: bytes
+    walk: _png.Walk
+    figure: dict
+    legacy: bool = False
+
+
+def _kept_image_png(kept: _Kept, itxt: bytes, gels: bytes) -> bytes:
     """The previous carrier PNG with a new JSON and new geLs chunks. Every
     other chunk keeps its bytes, so the SVG's hash input does not change
     (§6.5)."""
 
-    png = panel.carrier.png
+    png = kept.png
+    data_types = (_png.GELS_TYPE, b"myWb") if kept.legacy else (_png.GELS_TYPE,)
+    keywords = (_carrier.GELSVG_KEYWORD, _carrier.LEGACY_KEYWORD) if kept.legacy else (_carrier.GELSVG_KEYWORD,)
     out = [_png.PNG_SIGNATURE]
-    for c in panel.carrier.walk.chunks:
+    for c in kept.walk.chunks:
         if c.type == b"IEND":
             break
-        if c.runs_past_end or not c.crc_ok or c.type == _png.GELS_TYPE:
+        if c.runs_past_end or not c.crc_ok or c.type in data_types:
             continue
-        if _carrier._keyword_of(c) == _carrier.GELSVG_KEYWORD:
+        if _carrier._keyword_of(c) in keywords:
             continue
         out.append(png[c.offset : c.offset + 12 + c.length])
         if c.type == b"IHDR":
@@ -224,10 +237,10 @@ def _channel_entry(pixels: np.ndarray) -> dict:
 
 
 def _build(content: Content, tool: Tool, saved_at: str | None, notes: list[WriteNote], *,
-           index: int | None, element, images: dict, metadata: dict, kept: Panel | None) -> bytes:
+           index: int | None, element, images: dict, metadata: dict, kept: _Kept | None) -> bytes:
     """Write the panel's JSON and carrier PNG, and read them back. `images`
     and `metadata` are the payloads already held, by key; `kept` is the
-    panel whose rendered image is kept, when no new one is given."""
+    rendered image kept when no new one is given."""
 
     data = copy.deepcopy(content.json)
     if type(data) is not dict or type(data.get("core")) is not dict:
@@ -269,7 +282,7 @@ def _build(content: Content, tool: Tool, saved_at: str | None, notes: list[Write
 
     # The figure record.
     if content.rendered is None:
-        figure = {k: copy.deepcopy(kept.figure[k]) for k in ("crop", "rendered_hash", "drawn_from")}
+        figure = copy.deepcopy(kept.figure)
     else:
         pixels = content.rendered
         if (pixels.dtype not in (np.uint8, np.uint16) or pixels.ndim not in (2, 3)
@@ -344,7 +357,9 @@ def rewrite_panel(panel: Panel, content: Content, tool: Tool, *, saved_at: str |
     images = {k: e for k, e in view.channel_images.items() if e.get("payload") is not None}
     metadata = {k: (r["entry"], r["payload"]) for k, r in view.source_metadata.items() if r.get("payload") is not None}
     png = _build(content, tool, saved_at, notes, index=index, element=panel.element, images=images,
-                 metadata=metadata, kept=panel)
+                 metadata=metadata,
+                 kept=_Kept(panel.carrier.png, panel.carrier.walk,
+                            {k: panel.figure[k] for k in ("crop", "rendered_hash", "drawn_from")}))
     if panel.figure.get("svg_hash") is not None:
         notes.append(WriteNote("svg_hash.removed", "The panel's svg_hash was left out: it recorded the SVG as an "
                                "earlier writer wrote it (§6.5).", index))

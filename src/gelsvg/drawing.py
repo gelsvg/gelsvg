@@ -55,7 +55,10 @@ def _channel(view: CoreView, element: dict, pixels: Mapping[str, np.ndarray]) ->
 
 
 def _reference_shape(view: CoreView) -> list[int]:
-    return view.source(view.blot[0]["source"])["shape"]
+    shape = view.source(view.blot[0]["source"]).get("shape")
+    if shape is None:
+        raise ValueError("The core cannot be drawn: the reference channel's source image has no 'shape'.")
+    return shape
 
 
 def aligned_size(core: dict) -> tuple[int, int]:

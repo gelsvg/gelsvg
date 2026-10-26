@@ -234,6 +234,13 @@ def test_drawing_needs_the_channel_images_and_a_valid_core():
         render(broken, pixels_of(a, b))
     with pytest.raises(ValueError, match="inside"):
         render(core, pixels_of(a, b), {"x": 1, "y": 0, "w": 8, "h": 6})
+    unsized = copy.deepcopy(core)
+    for source in unsized["sources"]:
+        source.pop("shape"), source.pop("dtype")
+        for channel in source["channels"]:
+            channel.pop("pixel_hash")
+    with pytest.raises(ValueError, match="shape"):
+        render(unsized, {})
 
 
 def test_a_drawn_panel_reads_back_and_draws_again_the_same():

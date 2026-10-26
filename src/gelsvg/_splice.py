@@ -184,16 +184,41 @@ def png_data_uri(png: bytes) -> bytes:
     return b"data:image/png;base64," + base64.b64encode(png)
 
 
+_TAG_END = re.compile(rb"[ \t\r\n]*(/?)>")
+
+
+def element_span(svg: bytes, element: Element) -> tuple[int, int]:
+    """The bytes of an element, from its start tag to the end of its end
+    tag (an element whose content holds no element of the same name)."""
+
+    match = _NAME.match(svg, element.offset)
+    name = match.group(0)[1:]
+    pos = match.end()
+    while (m := _ATTRIBUTE.match(svg, pos)) is not None:
+        pos = m.end()
+    close = _TAG_END.match(svg, pos)
+    if close.group(1):
+        return element.offset, close.end()
+    end = re.compile(rb"</" + re.escape(name) + rb"[ \t\r\n]*>").search(svg, close.end())
+    return element.offset, end.end()
+
+
+def apply(svg: bytes, edits: list[tuple[int, int, bytes]]) -> bytes:
+    """Replace each (start, end) byte range with its bytes; every other byte
+    stays as it was."""
+
+    out, pos = [], 0
+    for start, end, data in sorted(edits, key=lambda e: e[0]):
+        if start < pos:
+            raise ValueError("the edits overlap")
+        out += [svg[pos:start], data]
+        pos = end
+    out.append(svg[pos:])
+    return b"".join(out)
+
+
 def replace_hrefs(svg: bytes, replacements: list[tuple[Element, bytes]]) -> bytes:
     """Put a new PNG in each element's href; every other byte of the SVG
     stays as it was."""
 
-    spans = sorted(((href_span(svg, element), png) for element, png in replacements), key=lambda s: s[0][0])
-    out = []
-    pos = 0
-    for (start, end), png in spans:
-        out.append(svg[pos:start])
-        out.append(png_data_uri(png))
-        pos = end
-    out.append(svg[pos:])
-    return b"".join(out)
+    return apply(svg, [(*href_span(svg, element), png_data_uri(png)) for element, png in replacements])
