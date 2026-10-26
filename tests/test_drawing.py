@@ -11,7 +11,7 @@ import pytest
 import builders as B
 import panels as P
 from gelsvg import (Content, Kind, Tool, _render, aligned_image, aligned_size, default_crop, new_panel, pixel_hash,
-                    render)
+                    render, to_channel, to_panel)
 from gelsvg._geometry import cos_sin
 from gelsvg.document import read
 
@@ -252,3 +252,38 @@ def test_a_drawn_panel_reads_back_and_draws_again_the_same():
     assert p.checks["drawn_from"] and p.checks["rendered_hash"]
     again = render(p.to_json()["core"], p.channel_images, p.figure["crop"])
     assert np.array_equal(again, p.rendered)
+
+
+# --- points ---------------------------------------------------------------------------------------
+
+
+def test_pixel_centres_follow_the_pixels_through_turns_and_flips():
+    core, a, b = two_channel_core()
+    core["blot"][1]["flip"] = True
+    core["orientation"] = {"turn": 270, "flip": True, "rotation": 0}
+    b_big = random_image(8, 6, seed=9)  # turned by 90°, it is already the reference size: no resize
+    core["sources"][1].update(shape=[8, 6])
+    core["sources"][1]["channels"][0]["pixel_hash"] = pixel_hash(b_big)
+    image = aligned_image(core, pixels_of(a, b_big), 1)
+    for i, j in [(0, 0), (7, 5), (3, 2), (5, 0)]:
+        x, y = to_panel(core, j + 0.5, i + 0.5, 1)
+        assert (x % 1, y % 1) == (0.5, 0.5)
+        assert image[int(y), int(x)] == b_big[i, j]
+        assert to_channel(core, x, y, 1) == (j + 0.5, i + 0.5)
+
+
+@pytest.mark.parametrize("element", [0, 1, "marker"])
+def test_points_go_there_and_back(element):
+    core, a, b = two_channel_core()
+    core["orientation"] = {"turn": 90, "flip": True, "rotation": 7.75}
+    core["marker"] = {"source": "s2", "source_channel": "gray", "turn": 180, "flip": True, "invert": False,
+                      "contrast": [0, 255]}
+    for point in [(0.0, 0.0), (3.25, 1.5), (5.9, 7.1)]:
+        back = to_channel(core, *to_panel(core, *point, element), element)
+        assert back == pytest.approx(point, abs=1e-12)
+
+
+def test_a_point_through_a_resize():
+    core, _, _ = two_channel_core()  # the second channel, 4 × 3, turned by 90° to 3 × 4, is resized to 6 × 8
+    assert to_panel(core, 0.0, 0.0, 1) == (8.0, 0.0)
+    assert to_panel(core, 1.5, 2.0, 1) == (4.0, 3.0)

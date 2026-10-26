@@ -128,3 +128,92 @@ def render(core: dict, pixels: Mapping[str, np.ndarray], crop: dict | None = Non
         high_bit = high_bit or image.dtype == np.uint16
     grey = len(view.blot) == 1 and colors[0] is None
     return _render.compose(levels, None if grey else colors, high_bit, view.output_bit_depth)
+
+
+# --- points -------------------------------------------------------------------------------------
+
+
+def _stages(view: CoreView, element: int | str) -> list[tuple]:
+    """The transforms from the element's channel image to the aligned
+    image (§4.2), each with the size of the image it starts from."""
+
+    marker = element == "marker"
+    item = view.marker if marker else view.blot[element]
+    height, width = view.source(item["source"])["shape"]
+    stages = []
+
+    def turn(degrees):
+        nonlocal height, width
+        stages.append(("rotate", degrees, width, height))
+        frame_w, frame_h = _geometry.rotated_frame(width, height, degrees)
+        width, height = round(frame_w), round(frame_h)
+
+    def flip():
+        stages.append(("flip", width))
+
+    if marker or element != 0:
+        if item["turn"]:
+            turn(item["turn"])
+        if item["flip"]:
+            flip()
+        ref_h, ref_w = _reference_shape(view)
+        if (height, width) != (ref_h, ref_w):
+            stages.append(("resize", width, height, ref_w, ref_h))
+            height, width = ref_h, ref_w
+    orientation = view.orientation
+    if orientation["turn"]:
+        turn(orientation["turn"])
+    if orientation["flip"]:
+        flip()
+    if orientation["rotation"]:
+        turn(orientation["rotation"])
+    return stages
+
+
+def _forward(stage: tuple, x: float, y: float) -> tuple[float, float]:
+    kind = stage[0]
+    if kind == "flip":
+        return stage[1] - x, y
+    if kind == "resize":
+        _, w, h, new_w, new_h = stage
+        return (x * new_w) / w, (y * new_h) / h
+    _, degrees, w, h = stage
+    c, s = _geometry.cos_sin(degrees)
+    frame_w, frame_h = _geometry.rotated_frame(w, h, degrees)
+    return (((c * (x - w / 2)) - (s * (y - h / 2))) + frame_w / 2,
+            ((s * (x - w / 2)) + (c * (y - h / 2))) + frame_h / 2)
+
+
+def _backward(stage: tuple, x: float, y: float) -> tuple[float, float]:
+    kind = stage[0]
+    if kind == "flip":
+        return stage[1] - x, y
+    if kind == "resize":
+        _, w, h, new_w, new_h = stage
+        return (x * w) / new_w, (y * h) / new_h
+    _, degrees, w, h = stage
+    c, s = _geometry.cos_sin(degrees)
+    frame_w, frame_h = _geometry.rotated_frame(w, h, degrees)
+    return (((c * (x - frame_w / 2)) + (s * (y - frame_h / 2))) + w / 2,
+            (((-s) * (x - frame_w / 2)) + (c * (y - frame_h / 2))) + h / 2)
+
+
+def to_channel(core: dict, x: float, y: float, element: int | str = 0) -> tuple[float, float]:
+    """Where the panel's point (x, y) lies on the channel image of the blot
+    element at `element`, or of the marker image (`"marker"`): §4.2
+    followed backwards (§4.3). Points are not rounded."""
+
+    view = _view(core, marker=element == "marker")
+    for stage in reversed(_stages(view, element)):
+        x, y = _backward(stage, x, y)
+    return x, y
+
+
+def to_panel(core: dict, x: float, y: float, element: int | str = 0) -> tuple[float, float]:
+    """Where a point of the element's channel image lies in the panel's
+    coordinates (§4.2, §4.3)."""
+
+    view = _view(core, marker=element == "marker")
+    for stage in _stages(view, element):
+        x, y = _forward(stage, x, y)
+    return x, y
