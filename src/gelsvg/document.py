@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 
+from . import _svghash
 from .container import Container, LegacySlot, read_container
 from .notices import Kind, Notice
 from .panel import Panel, read_panel
@@ -53,8 +54,37 @@ def read(svg: bytes) -> Document:
     doc = Document(container=container, notices=list(container.notices))
     for slot in container.panels:
         doc.panels.append(read_panel(slot.index, slot.element, slot.carrier))
+    _check_svg_hash(doc, svg)
     _group_assemblies(doc)
     return doc
+
+
+def _check_svg_hash(doc: Document, svg: bytes) -> None:
+    """Compare each panel's svg_hash with the SVG as it is now (§6.5)."""
+
+    wanted = [p for p in doc.panels if p.figure.get("svg_hash") and p.figure.get("svg_hash_method")]
+    if not wanted:
+        return
+    try:
+        actual = _svghash.svg_hash(svg)
+    except _svghash.Unavailable:
+        actual = None
+    for panel in wanted:
+        recorded = panel.figure["svg_hash"]
+        if actual is None or not recorded.startswith("sha256:"):
+            panel.checks["svg_hash"] = None
+            panel.notices.append(Notice(Kind.CHECK, "check.svg_hash.unknown",
+                                        "Whether the SVG changed after this panel was written could not be checked.",
+                                        panel=panel.index))
+            continue
+        panel.checks["svg_hash"] = recorded == actual
+        if recorded == actual:
+            message = "Checked whether the SVG changed after this panel was written: it has not."
+        else:
+            message = ("Checked whether the SVG changed after this panel was written: it has (by an editor, by being "
+                       "moved to another figure, or by a later writer that kept this panel as it was).")
+        panel.notices.append(Notice(Kind.CHECK, "check.svg_hash." + ("matched" if recorded == actual else "differs"),
+                                    message, panel=panel.index))
 
 
 def _stop_element(image, member_of, number_set, counts):

@@ -7,7 +7,7 @@ import hashlib
 
 import numpy as np
 
-from . import _check as C, _hashes, _json, _png
+from . import _check as C, _hashes, _json, _metadata, _png
 from ._carrier import Carrier
 from ._check import Context
 from ._core import CoreView
@@ -168,6 +168,12 @@ def check_embedded(ctx: Context, view: CoreView, carrier: Carrier) -> dict:
                 used2.add(body)
                 if len(payload.payload) != entry["byte_length"]:
                     problems.append("'byte_length' does not match the payload")
+                elif entry["readable"]:
+                    index, why = _metadata.check_formal(entry["format"], payload.payload)
+                    if why:
+                        problems.append(why)
+                    else:
+                        entry["index"] = index
         if problems:
             ctx.broken("element.broken", "The source metadata was dropped: " + "; ".join(problems) + ".", where)
             del view.source_metadata[key]
