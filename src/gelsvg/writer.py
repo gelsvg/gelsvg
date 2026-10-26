@@ -61,8 +61,8 @@ class Content:
     `figure` itself; of `figure`, only `crop` is read from `json`.
 
     `rendered` is a rendered image the caller drew from this core (§6.2)
-    over `json["figure"]["crop"]`; `drawn_from` and `rendered_hash` are
-    computed from it. A new panel needs one. When a changed panel has none,
+    over `json["figure"]["crop"]`, as `drawing.render()` draws it;
+    `drawn_from` and `rendered_hash` are computed from it. A new panel needs one. When a changed panel has none,
     its previous rendered image is kept as it was, and so are `crop`,
     `rendered_hash` and `drawn_from` (§6.4: a changed core then shows the
     figure as older than the data).
