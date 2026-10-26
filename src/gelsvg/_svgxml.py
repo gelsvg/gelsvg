@@ -37,6 +37,8 @@ class Element:
     children: list["Element"] = field(default_factory=list)
     order: int = 0
     """Position in document order, counting from 0."""
+    offset: int = 0
+    """Byte offset of the start tag's `<` in the SVG."""
 
     def ancestors(self):
         node = self.parent
@@ -171,7 +173,7 @@ def parse(svg: bytes) -> Tree:
     def start(name, attrs):
         namespace, local = _split_name(name)
         parent = stack[-1] if stack else None
-        element = Element(namespace, local, dict(attrs), parent, order=len(elements))
+        element = Element(namespace, local, dict(attrs), parent, order=len(elements), offset=parser.CurrentByteIndex)
         if parent is not None:
             parent.children.append(element)
         elements.append(element)

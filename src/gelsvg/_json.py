@@ -183,7 +183,7 @@ def number(x: int | float) -> str:
     return sign + digits[0] + "." + digits[1:] + "e" + exp_text
 
 
-def _serialize(value, out: list[str]) -> None:
+def _serialize(value, out: list[str], sort: bool = True) -> None:
     if value is None:
         out.append("null")
     elif value is True:
@@ -199,19 +199,20 @@ def _serialize(value, out: list[str]) -> None:
         for i, item in enumerate(value):
             if i:
                 out.append(",")
-            _serialize(item, out)
+            _serialize(item, out, sort)
         out.append("]")
     elif isinstance(value, dict):
         out.append("{")
-        for i, key in enumerate(sorted(value, key=lambda k: k.encode("utf-16-be"))):
+        keys = sorted(value, key=lambda k: k.encode("utf-16-be")) if sort else list(value)
+        for i, key in enumerate(keys):
             if i:
                 out.append(",")
             out.append(_string(key))
             out.append(":")
-            _serialize(value[key], out)
+            _serialize(value[key], out, sort)
         out.append("}")
     else:
-        raise TypeError(f"cannot canonicalize {type(value).__name__}")
+        raise TypeError(f"{type(value).__name__} has no JSON form")
 
 
 def canonical(value) -> bytes:
@@ -219,4 +220,13 @@ def canonical(value) -> bytes:
 
     out: list[str] = []
     _serialize(value, out)
+    return "".join(out).encode("utf-8")
+
+
+def dumps(value) -> bytes:
+    """A JSON value as UTF-8 bytes, written like the canonical form but with
+    the keys in their order in each object."""
+
+    out: list[str] = []
+    _serialize(value, out, sort=False)
     return "".join(out).encode("utf-8")

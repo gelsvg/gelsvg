@@ -53,6 +53,14 @@ class Panel:
     """Results of the comparisons: True (matched), False (differs), None
     (could not be checked)."""
 
+    def to_json(self) -> dict:
+        """The panel as read, as JSON to change and write again
+        (writer.Rewrite): what reading ignored or dropped is left out, and
+        so is `embedded`, which the writer rebuilds."""
+
+        from ._tojson import panel_json
+        return panel_json(self)
+
 
 def _rfc3339(value) -> bool:
     if not C.is_str(value) or _RFC3339.fullmatch(value) is None:

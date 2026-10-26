@@ -1,0 +1,363 @@
+"""Saving a document again (§2.6 rule 6).
+
+Panels the caller did not change are written byte for byte. A panel the
+caller changed is written again from its JSON, and its new carrier PNG goes
+into the SVG in place of the old one; nothing else in the SVG changes. A
+panel whose assembly record alone changes keeps every byte but that record
+(the assembly-only rewrite). Drawing the figure is the tool's job, not this
+module's.
+"""
+
+from __future__ import annotations
+
+import copy
+from dataclasses import dataclass, field
+from datetime import datetime
+import zlib
+
+import numpy as np
+
+from . import _carrier, _check as C, _datauri, _encode, _hashes, _json, _png, _splice, _svgxml
+from ._core import CHANNEL_IMAGE_KIND, CHANNEL_IMAGE_MEDIA
+from .document import Document
+from .notices import Kind, Notice
+from .panel import FORMAT_URL, Panel, read_panel
+
+_TOP = ("format", "schema_version", "schema_revision", "saved_at", "written_by", "core", "quantifications", "figure")
+
+
+@dataclass(frozen=True)
+class Tool:
+    """The writer, recorded as `written_by` in each panel it writes (§3)."""
+
+    name: str
+    version: str
+    build: str | None = None
+
+    def record(self) -> dict:
+        out = {"name": self.name, "version": self.version}
+        if self.build is not None:
+            out["build"] = self.build
+        return out
+
+
+@dataclass
+class Rewrite:
+    """A panel the caller changed.
+
+    `json` is the panel to write, usually `panel.to_json()` after the
+    caller's edits. The writer sets `format`, the version, `saved_at` and
+    `written_by`, rebuilds `embedded`, and keeps `figure` itself.
+
+    `rendered`, when given, is a rendered image the caller drew from this
+    core (§6.2) over `json["figure"]["crop"]`; `drawn_from` and
+    `rendered_hash` are then computed. Without it the previous rendered
+    image is kept as it was, and so are `crop`, `rendered_hash` and
+    `drawn_from` (§6.4: a changed core then shows the figure as older than
+    the data).
+
+    `channel_images` and `source_metadata` add payloads for what the JSON
+    points to beyond what the panel already holds: channel images as
+    pixels, source metadata as (catalog entry, payload)."""
+
+    json: dict
+    rendered: np.ndarray | None = None
+    channel_images: list[np.ndarray] = field(default_factory=list)
+    source_metadata: list[tuple[dict, bytes]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class WriteNote:
+    """Something the writer did that the caller may want to pass on."""
+
+    code: str
+    message: str
+    panel: int | None = None
+
+
+class WriteError(Exception):
+    """The document was not written. `notices` tells what reading the panel
+    as it would have been written found wrong."""
+
+    def __init__(self, message: str, panel: int | None = None, notices: list[Notice] | None = None):
+        super().__init__(message)
+        self.panel = panel
+        self.notices = list(notices or [])
+
+
+@dataclass
+class Saved:
+    svg: bytes
+    notes: list[WriteNote] = field(default_factory=list)
+
+
+def _now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+# --- the assembly-only rewrite ---------------------------------------------------------------------
+
+
+def _check_assembly(record, index: int) -> dict | None:
+    if record is None:
+        return None
+    if (type(record) is not dict or set(record) != {"id", "member", "members"} or not C.is_id(record["id"])
+            or not C.is_int(record["member"]) or not C.is_int(record["members"])
+            or not 1 <= record["member"] <= record["members"]):
+        raise WriteError("An assembly record is an object of exactly 'id' (an ID), 'member' and 'members' "
+                         "(integers, 1 ≤ member ≤ members).", index)
+    return {"id": record["id"], "member": record["member"], "members": record["members"]}
+
+
+def assembly_only(panel: Panel, record: dict | None, allow_loss: bool = False) -> bytes:
+    """The panel's carrier PNG with only the top-level `assembly` changed
+    (None takes it out)."""
+
+    record = _check_assembly(record, panel.index)
+    if not panel.readable or panel.newer_version or panel.schema_version != C.KNOWN_VERSION:
+        raise WriteError("Only the assembly record of a readable panel of this version of the format can be "
+                         "changed; this panel keeps its record, and so leaves the assembly.", panel.index)
+    raw = panel.raw.get("assembly")
+    if type(raw) is dict and set(raw) - {"id", "member", "members"} and not allow_loss:
+        raise WriteError("The panel's assembly record has keys this writer does not know; changing it drops them. "
+                         "Pass allow_loss=True to go ahead.", panel.index)
+    if raw == record and ("assembly" in panel.raw) == (record is not None):
+        return panel.carrier.png
+    (chunk,) = _carrier.find_keyword(panel.carrier.walk, _carrier.GELSVG_KEYWORD)
+    fields, _ = _carrier.parse_itxt(chunk.data)
+    text = _splice.replace_top_member(fields.text, "assembly", record)
+    body = zlib.compress(text, 9) if fields.compression_flag == 1 else text
+    data = (fields.keyword + b"\0" + bytes([fields.compression_flag, fields.compression_method])
+            + fields.language_tag + b"\0" + fields.translated_keyword + b"\0" + body)
+    png = panel.carrier.png
+    return png[: chunk.offset] + _encode.chunk(b"iTXt", data) + png[chunk.offset + 12 + chunk.length :]
+
+
+# --- a rewritten panel -----------------------------------------------------------------------------
+
+
+def _kept_image(panel: Panel) -> None:
+    """Refuse to keep a rendered image the panel cannot be written with
+    (§6.2, §2.6 rule 6)."""
+
+    carrier = panel.carrier
+    why = None
+    if not carrier.rendered_usable or panel.rendered is None:
+        why = "its rendered image cannot be used"
+    elif any(panel.figure.get(k) is None for k in ("crop", "rendered_hash", "drawn_from")):
+        why = "'figure' lacks a value it must have"
+    elif panel.checks.get("rendered_hash") is None:
+        why = "its rendered image cannot be checked against 'rendered_hash'"
+    elif any(n.code == "check.rendered_form" for n in panel.notices):
+        why = "its rendered image's PNG form does not match the core it was drawn from"
+    if why:
+        raise WriteError(f"The panel cannot be written with its previous rendered image: {why}. "
+                         "Draw it again and pass the pixels as Rewrite.rendered.", panel.index)
+
+
+def _kept_image_png(panel: Panel, itxt: bytes, gels: bytes) -> bytes:
+    """The previous carrier PNG with a new JSON and new geLs chunks. Every
+    other chunk keeps its bytes, so the SVG's hash input does not change
+    (§6.5)."""
+
+    png = panel.carrier.png
+    out = [_png.PNG_SIGNATURE]
+    for c in panel.carrier.walk.chunks:
+        if c.type == b"IEND":
+            break
+        if c.runs_past_end or not c.crc_ok or c.type == _png.GELS_TYPE:
+            continue
+        if _carrier._keyword_of(c) == _carrier.GELSVG_KEYWORD:
+            continue
+        out.append(png[c.offset : c.offset + 12 + c.length])
+        if c.type == b"IHDR":
+            out.append(itxt)
+    out += [gels, _encode.IEND]
+    return b"".join(out)
+
+
+def _with_embedded(core: dict, embedded: dict) -> dict:
+    out = {}
+    for key, value in core.items():
+        out[key] = value
+        if key == "sources":
+            out["embedded"] = embedded
+    if "embedded" not in out:
+        out["embedded"] = embedded
+    return out
+
+
+def _problem(notice: Notice, carried: set[str]) -> bool:
+    if notice.kind is Kind.CHECK:
+        return notice.code in ("check.rendered_form", "check.crop.size")
+    if notice.code == "metadata.free_form":
+        return False
+    where = notice.where or ""
+    return not any(where.startswith(f"core.embedded.source_metadata[{key!r}]") for key in carried)
+
+
+def rewrite_panel(panel: Panel, change: Rewrite, tool: Tool, *, saved_at: str | None = None,
+                  allow_loss: bool = False, notes: list[WriteNote] | None = None) -> bytes:
+    """The new carrier PNG of a panel the caller changed. Raises WriteError
+    when the panel cannot be written as the format requires."""
+
+    notes = notes if notes is not None else []
+    index = panel.index
+    if not panel.readable or panel.newer_version:
+        raise WriteError("The panel was not read (unreadable, or of a newer version of the format), so it can only "
+                         "be kept byte for byte.", index)
+    if panel.newer_revision and not allow_loss:
+        raise WriteError("The panel is of a newer revision; writing it again drops what that revision added. "
+                         "Pass allow_loss=True to go ahead.", index)
+    data = copy.deepcopy(change.json)
+    if type(data) is not dict or type(data.get("core")) is not dict:
+        raise WriteError("Rewrite.json must be an object with a 'core' object.", index)
+    core = data["core"]
+    core.pop("embedded", None)
+
+    # Payloads: what the panel holds, and what the caller adds.
+    view = panel.core
+    images = {k: e for k, e in view.channel_images.items() if e.get("payload") is not None}
+    for pixels in change.channel_images:
+        key = _hashes.pixel_hash(pixels)
+        if key in images:
+            continue  # the panel holds it already: its bytes are kept
+        png = _encode.channel_png(pixels)
+        images[key] = {
+            "dtype": "uint8" if pixels.dtype == np.uint8 else "uint16", "shape": list(pixels.shape),
+            "byte_length": len(png), "png_hash": _hashes.sha256(png), "payload": png}
+    metadata = {k: (r["entry"], r["payload"]) for k, r in view.source_metadata.items() if r.get("payload") is not None}
+    carried = {k for k, r in view.source_metadata.items() if r.get("payload") is not None and not r["readable"]}
+    for entry, payload in change.source_metadata:
+        metadata[_hashes.sha256(_json.canonical(entry))] = (entry, payload)
+
+    image_catalog, metadata_catalog = {}, {}
+    for source in core.get("sources") if type(core.get("sources")) is list else ():
+        if type(source) is not dict:
+            continue
+        for channel in source.get("channels") if type(source.get("channels")) is list else ():
+            key = channel.get("pixel_hash") if type(channel) is dict else None
+            if key in images and key not in image_catalog:
+                e = images[key]
+                image_catalog[key] = {"kind": CHANNEL_IMAGE_KIND, "media_type": CHANNEL_IMAGE_MEDIA, "dtype": e["dtype"],
+                                      "shape": e["shape"], "byte_length": e["byte_length"], "png_hash": e["png_hash"]}
+        key = source.get("source_metadata")
+        if key in metadata and key not in metadata_catalog:
+            metadata_catalog[key] = metadata[key][0]
+    embedded = {}
+    if image_catalog:
+        embedded["channel_images"] = image_catalog
+    if metadata_catalog:
+        embedded["source_metadata"] = metadata_catalog
+    if embedded:
+        core = _with_embedded(core, embedded)
+
+    # The figure record.
+    if change.rendered is None:
+        _kept_image(panel)
+        figure = {k: copy.deepcopy(panel.figure[k]) for k in ("crop", "rendered_hash", "drawn_from")}
+    else:
+        pixels = change.rendered
+        if (pixels.dtype not in (np.uint8, np.uint16) or pixels.ndim not in (2, 3)
+                or (pixels.ndim == 3 and pixels.shape[2] != 3) or 0 in pixels.shape):
+            raise WriteError("Rewrite.rendered must be a grey (h, w) or RGB (h, w, 3) image of uint8 or uint16.", index)
+        crop = (data.get("figure") or {}).get("crop") if type(data.get("figure")) is dict else None
+        figure = {"crop": crop, "rendered_hash": _hashes.rendered_hash(pixels), "drawn_from": _hashes.core_hash(core)}
+    if panel.figure.get("svg_hash") is not None:
+        notes.append(WriteNote("svg_hash.removed", "The panel's svg_hash was left out: it recorded the SVG as an "
+                               "earlier writer wrote it (§6.5).", index))
+
+    # Quantifications measured on another core are dropped (§7.4).
+    quant_hash = _hashes.quant_core_hash(core)
+    quants = data.get("quantifications")
+    if type(quants) is list:
+        kept = []
+        for i, q in enumerate(quants):
+            if type(q) is dict and q.get("computed_on") != quant_hash:
+                notes.append(WriteNote("quantification.stale", f"The quantification {i} was measured on another core "
+                                       "and was left out (§7.4).", index))
+                continue
+            kept.append(q)
+        quants = kept or None
+
+    out = {"format": FORMAT_URL, "schema_version": C.KNOWN_VERSION, "schema_revision": C.KNOWN_REVISION,
+           "saved_at": saved_at or _now(), "written_by": tool.record(), "core": core}
+    if quants is not None:
+        out["quantifications"] = quants  # anything but a list is left for the check below to refuse
+    out["figure"] = figure
+    for key, value in data.items():
+        if key not in _TOP:
+            out[key] = value
+    try:
+        text = _json.dumps(out)
+    except (TypeError, ValueError, UnicodeEncodeError) as exc:
+        raise WriteError(f"The panel's JSON cannot be written: {exc}.", index) from None
+
+    itxt = _encode.itxt(text)
+    gels = _encode.gels_chunks([images[k]["payload"] for k in image_catalog],
+                               [metadata[k][1] for k in metadata_catalog])
+    if change.rendered is None:
+        png = _kept_image_png(panel, itxt, gels)
+    else:
+        header, stream = _encode.encode_image(change.rendered)
+        png = _png.PNG_SIGNATURE + header + itxt + _encode.idat_chunks(stream) + gels + _encode.IEND
+
+    # Read it back: what would be written must read without a problem.
+    walk = _png.walk(png)
+    carrier = _carrier.assess(png, walk, _carrier.find_keyword(walk, _carrier.GELSVG_KEYWORD))
+    check = read_panel(index, panel.element, carrier)
+    problems = [n for n in check.notices if _problem(n, carried)]
+    if problems:
+        raise WriteError("The panel would not be written as the format requires: "
+                         + "; ".join(n.message for n in problems[:3]) + ("…" if len(problems) > 3 else ""),
+                         index, problems)
+    return png
+
+
+# --- the document --------------------------------------------------------------------------------
+
+
+def save(document: Document, tool: Tool, *, rewrite: dict[int, Rewrite] | None = None,
+         assembly: dict[int, dict | None] | None = None, allow_loss: bool = False,
+         saved_at: str | None = None) -> Saved:
+    """Write the document again. `rewrite` maps panel indexes to the panels
+    the caller changed; `assembly` maps indexes of panels kept byte for
+    byte to their new assembly record (None leaves the assembly). Every
+    other panel, and every other byte of the SVG, is written as read.
+
+    Raises WriteError, writing nothing, when a panel cannot be written as
+    asked."""
+
+    rewrite = rewrite or {}
+    assembly = assembly or {}
+    if not document.is_document:
+        raise WriteError("This file is not a GelSVG document.")
+    both = set(rewrite) & set(assembly)
+    if both:
+        raise WriteError("A rewritten panel carries its assembly record in its JSON; it cannot also be given one "
+                         f"in 'assembly' (panels {sorted(both)}).")
+    for index in [*rewrite, *assembly]:
+        if not 0 <= index < len(document.panels):
+            raise WriteError(f"There is no panel {index}.")
+
+    notes: list[WriteNote] = []
+    stamp = saved_at or _now()
+    pngs: dict[int, bytes] = {}
+    for index, change in sorted(rewrite.items()):
+        pngs[index] = rewrite_panel(document.panels[index], change, tool, saved_at=stamp,
+                                    allow_loss=allow_loss, notes=notes)
+    for index, record in sorted(assembly.items()):
+        png = assembly_only(document.panels[index], record, allow_loss=allow_loss)
+        if png is not document.panels[index].carrier.png:
+            pngs[index] = png
+    if not pngs:
+        return Saved(document.svg, notes)
+
+    panels = document.panels
+    svg = _splice.replace_hrefs(document.svg, [(panels[i].element, png) for i, png in pngs.items()])
+    tree = _svgxml.parse(svg)
+    for index, png in pngs.items():
+        element = tree.elements[panels[index].element.order]
+        if _datauri.decode_png_data_uri(_datauri.image_href(element.attributes) or "") != png:
+            raise WriteError("The new PNG could not be put into the SVG.", index)
+    return Saved(svg, notes)

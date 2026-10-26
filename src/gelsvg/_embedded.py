@@ -138,6 +138,7 @@ def check_embedded(ctx: Context, view: CoreView, carrier: Carrier) -> dict:
                     problems.append("its dtype and shape do not match the source image")
                 else:
                     images[key] = pixels
+                    entry["payload"] = payload.payload
         if problems:
             ctx.broken("element.broken", "The channel image was dropped: " + "; ".join(problems)
                        + ". Its channel is read as not embedded.", where)

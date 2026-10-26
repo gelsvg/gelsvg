@@ -30,6 +30,8 @@ class Document:
     panels: list[Panel] = field(default_factory=list)
     assemblies: list[Assembly] = field(default_factory=list)
     notices: list[Notice] = field(default_factory=list)
+    svg: bytes = field(default=b"", repr=False)
+    """The SVG as read; a writer changes only the bytes it must."""
 
     @property
     def is_document(self) -> bool:
@@ -51,7 +53,7 @@ def read(svg: bytes) -> Document:
     read is reported in the notices."""
 
     container = read_container(svg)
-    doc = Document(container=container, notices=list(container.notices))
+    doc = Document(container=container, notices=list(container.notices), svg=svg)
     for slot in container.panels:
         doc.panels.append(read_panel(slot.index, slot.element, slot.carrier))
     _check_svg_hash(doc, svg)
