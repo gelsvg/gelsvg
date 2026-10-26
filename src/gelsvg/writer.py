@@ -187,13 +187,10 @@ def _with_embedded(core: dict, embedded: dict) -> dict:
     return out
 
 
-def _problem(notice: Notice, carried: set[str]) -> bool:
+def _problem(notice: Notice) -> bool:
     if notice.kind is Kind.CHECK:
         return notice.code in ("check.rendered_form", "check.crop.size")
-    if notice.code == "metadata.free_form":
-        return False
-    where = notice.where or ""
-    return not any(where.startswith(f"core.embedded.source_metadata[{key!r}]") for key in carried)
+    return notice.code not in ("metadata.free_form", "metadata.unknown")  # carried over unread (§5.4)
 
 
 def rewrite_panel(panel: Panel, change: Rewrite, tool: Tool, *, saved_at: str | None = None,
@@ -227,7 +224,6 @@ def rewrite_panel(panel: Panel, change: Rewrite, tool: Tool, *, saved_at: str | 
             "dtype": "uint8" if pixels.dtype == np.uint8 else "uint16", "shape": list(pixels.shape),
             "byte_length": len(png), "png_hash": _hashes.sha256(png), "payload": png}
     metadata = {k: (r["entry"], r["payload"]) for k, r in view.source_metadata.items() if r.get("payload") is not None}
-    carried = {k for k, r in view.source_metadata.items() if r.get("payload") is not None and not r["readable"]}
     for entry, payload in change.source_metadata:
         metadata[_hashes.sha256(_json.canonical(entry))] = (entry, payload)
 
@@ -306,7 +302,7 @@ def rewrite_panel(panel: Panel, change: Rewrite, tool: Tool, *, saved_at: str | 
     walk = _png.walk(png)
     carrier = _carrier.assess(png, walk, _carrier.find_keyword(walk, _carrier.GELSVG_KEYWORD))
     check = read_panel(index, panel.element, carrier)
-    problems = [n for n in check.notices if _problem(n, carried)]
+    problems = [n for n in check.notices if _problem(n)]
     if problems:
         raise WriteError("The panel would not be written as the format requires: "
                          + "; ".join(n.message for n in problems[:3]) + ("…" if len(problems) > 3 else ""),

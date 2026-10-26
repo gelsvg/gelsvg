@@ -286,7 +286,7 @@ def test_an_unchanged_assembly_record_keeps_the_svg():
 # --- what a rewrite carries over ------------------------------------------------------------------
 
 
-def with_metadata(fmt: str = "png", version: int = 1):
+def with_metadata(fmt: str = "png", version: int = 1, revision: int = 0):
     import hashlib
     from gelsvg import _json
     from test_metadata import PNG_INDEX, payload
@@ -297,6 +297,7 @@ def with_metadata(fmt: str = "png", version: int = 1):
     panel, channel, rendered = P.base_panel()
     panel["core"]["sources"][0]["source_metadata"] = key
     panel["core"]["embedded"]["source_metadata"] = {key: entry}
+    panel["schema_revision"] = revision
     return read(P.svg_of(P.carrier_png(panel, channel, rendered, extra_after=[B.gels(data, codec=2)]))), key, data
 
 
@@ -306,6 +307,14 @@ def test_source_metadata_is_carried_over(fmt):
     p = read(save(doc, TOOL, rewrite={0: edited(doc, 0, lambda d: d["core"].update(note="x"))}).svg).panels[0]
     assert p.core.sources[0]["source_metadata"] == key and p.core.source_metadata[key]["payload"] == data
     assert not [n for n in problems(p) if n.code != "metadata.free_form"]
+
+
+def test_metadata_of_a_newer_version_moves_into_this_revision_unread():
+    doc, key, data = with_metadata("tiff", version=2, revision=1)
+    saved = save(doc, TOOL, rewrite={0: edited(doc, 0, lambda d: d["core"].update(note="x"))}, allow_loss=True)
+    p = read(saved.svg).panels[0]
+    assert p.schema_revision == 0 and p.core.source_metadata[key]["payload"] == data
+    assert [n.code for n in problems(p)] == ["metadata.unknown"]
 
 
 def test_a_damaged_ancillary_chunk_is_left_out():

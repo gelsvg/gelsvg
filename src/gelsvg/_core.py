@@ -290,21 +290,19 @@ def _read_metadata_entry(ctx: Context, key: str, entry, where: str):
         problems.append("it has keys this closed object does not allow")
     if problems:
         return None, problems
-    formal = fmt in FORMAL_METADATA
-    free = fmt.startswith("https://")
-    usable = True
-    if formal and version != 1:
-        usable = False
-        if not ctx.unknown_value(f"{where}.version", version):
-            return None, [f"'version' {version} is not defined for the format {fmt!r}"]
-    elif free:
-        usable = False  # free-form contents are their owner's (rule 2 regardless of revision)
+    # An unknown format or version is rule 2 whatever the revision (§5.4):
+    # writers carry unread metadata over, also into panels of an older
+    # revision.
+    usable = False
+    if fmt.startswith("https://"):
         ctx.note(C.Kind.UNKNOWN, "metadata.free_form",
                  f"Source metadata in the free-form format {fmt!r} is kept but not read.", where)
-    elif not formal:
-        usable = False
-        if not ctx.unknown_value(f"{where}.format", fmt):
-            return None, [f"'format' {fmt!r} is neither a formal format nor an https URL"]
+    elif fmt not in FORMAL_METADATA or version != 1:
+        ctx.note(C.Kind.UNKNOWN, "metadata.unknown",
+                 f"Source metadata in a format or version this reader does not know ({fmt!r}, version {version}) "
+                 "is kept but not read.", where)
+    else:
+        usable = True
     return {"format": fmt, "version": version, "byte_length": length, "payload_hash": payload_hash,
             "readable": usable, "entry": entry}, []
 

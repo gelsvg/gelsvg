@@ -112,7 +112,10 @@ def test_free_form_metadata_is_kept_unread():
     assert "metadata.free_form" in [n.code for n in panel.notices]
 
 
-@pytest.mark.parametrize("revision, kept", [(0, False), (1, True)])
-def test_unknown_formal_version(revision, kept):
-    panel, key = panel_with_metadata(lambda e: e.update(version=2), revision=revision)
-    assert (key in panel.core.source_metadata) is kept
+@pytest.mark.parametrize("revision", [0, 1])
+@pytest.mark.parametrize("change", [lambda e: e.update(version=2), lambda e: e.update(format="bmp")])
+def test_unknown_format_or_version_is_kept_unread_in_any_revision(revision, change):
+    panel, key = panel_with_metadata(change, revision=revision)
+    assert panel.core.source_metadata[key]["readable"] is False
+    assert [n.kind for n in panel.notices if n.code == "metadata.unknown"] == [Kind.UNKNOWN]
+    assert not [n for n in panel.notices if n.kind is Kind.BROKEN]
