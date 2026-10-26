@@ -6,7 +6,7 @@ import pytest
 
 import builders as B
 import panels as P
-from gelsvg import Kind, Rewrite, Tool, WriteError, _carrier, _encode, _hashes, _png, _svghash, save
+from gelsvg import Content, Kind, Tool, WriteError, _carrier, _encode, _hashes, _png, _svghash, save
 from gelsvg._check import Context
 from gelsvg._core import read_core
 from gelsvg._embedded import decode_channel_png
@@ -32,10 +32,10 @@ def png_of(svg: bytes, index: int = 0) -> bytes:
     return read(svg).container.panels[index].carrier.png
 
 
-def edited(doc, index: int, change) -> Rewrite:
+def edited(doc, index: int, change) -> Content:
     data = doc.panels[index].to_json()
     change(data)
-    return Rewrite(data)
+    return Content(data)
 
 
 # --- PNG encoding ---------------------------------------------------------------------------------
@@ -212,7 +212,7 @@ def test_an_unusable_rendered_image_must_be_drawn_again():
 def test_requests_that_cannot_be_met():
     doc = two_panel_doc()
     with pytest.raises(WriteError):
-        save(doc, TOOL, rewrite={0: Rewrite(doc.panels[0].to_json())}, assembly={0: None})
+        save(doc, TOOL, rewrite={0: Content(doc.panels[0].to_json())}, assembly={0: None})
     with pytest.raises(WriteError):
         save(doc, TOOL, assembly={5: None})
     with pytest.raises(WriteError):

@@ -55,7 +55,7 @@ class Panel:
 
     def to_json(self) -> dict:
         """The panel as read, as JSON to change and write again
-        (writer.Rewrite): what reading ignored or dropped is left out, and
+        (writer.Content): what reading ignored or dropped is left out, and
         so is `embedded`, which the writer rebuilds."""
 
         from ._tojson import panel_json

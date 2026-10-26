@@ -4,11 +4,13 @@ from .container import Container, PanelSlot, read_container
 from .document import Assembly, Document, read
 from .notices import Kind, Notice
 from .panel import Panel
-from .writer import Rewrite, Saved, Tool, WriteError, WriteNote, save
+from .writer import (Content, Saved, Tool, WriteError, WriteNote, assembly_only, image_element, new_assembly_id,
+                     new_panel, rewrite_panel, save, sign)
 
 __version__ = "0.0.1.dev0"
 
 __all__ = [
-    "Assembly", "Container", "Document", "Kind", "Notice", "Panel", "PanelSlot", "Rewrite", "Saved", "Tool",
-    "WriteError", "WriteNote", "read", "read_container", "save", "__version__",
+    "Assembly", "Container", "Content", "Document", "Kind", "Notice", "Panel", "PanelSlot", "Saved", "Tool",
+    "WriteError", "WriteNote", "assembly_only", "image_element", "new_assembly_id", "new_panel", "read",
+    "read_container", "rewrite_panel", "save", "sign", "__version__",
 ]
