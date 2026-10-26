@@ -437,6 +437,46 @@ def _unfilter_pass(raw: np.ndarray, width: int, height: int, unit: int) -> np.nd
     return out
 
 
+def _unpack_bits(rows: np.ndarray, bit_depth: int, width: int) -> np.ndarray:
+    """Samples of fewer than 8 bits, first sample in the high bits."""
+
+    per_byte = 8 // bit_depth
+    shifts = np.arange(8 - bit_depth, -1, -bit_depth, dtype=np.uint8)
+    values = (rows[:, :, None] >> shifts) & ((1 << bit_depth) - 1)
+    return values.reshape(rows.shape[0], rows.shape[1] * per_byte)[:, :width].astype(np.uint8)
+
+
+def decode_samples(ihdr: Ihdr, raw: bytes) -> np.ndarray:
+    """The stored samples of any colour type and bit depth, shape (height,
+    width, samples per pixel): uint16 for 16 bits, else uint8 (fewer than 8
+    bits are not widened). `raw` must already have passed
+    `scanline_problem`."""
+
+    channels = _CHANNELS[ihdr.color_type]
+    data = np.frombuffer(raw, dtype=np.uint8)
+    pos = 0
+    if ihdr.bit_depth < 8:
+        out = np.zeros((ihdr.height, ihdr.width, 1), dtype=np.uint8)
+        for x0, y0, dx, dy, w, h in ihdr.passes():
+            row_bytes = ihdr.row_bytes(w)
+            size = h * (1 + row_bytes)
+            part = _unfilter_pass(data[pos : pos + size], row_bytes, h, 1)[..., 0]
+            out[y0::dy, x0::dx, 0] = _unpack_bits(part, ihdr.bit_depth, w)
+            pos += size
+        return out
+    unit = ihdr.filter_unit
+    full = np.zeros((ihdr.height, ihdr.width, unit), dtype=np.uint8)
+    for x0, y0, dx, dy, w, h in ihdr.passes():
+        size = h * (1 + w * unit)
+        part = _unfilter_pass(data[pos : pos + size], w, h, unit)
+        full[y0::dy, x0::dx] = part
+        pos += size
+    if ihdr.bit_depth == 8:
+        return full.reshape(ihdr.height, ihdr.width, channels)
+    pairs = full.reshape(ihdr.height, ihdr.width, channels, 2)
+    return np.ascontiguousarray((pairs[..., 0].astype(np.uint16) << 8) | pairs[..., 1])
+
+
 def decode_pixels(ihdr: Ihdr, raw: bytes) -> np.ndarray:
     """Pixels of a grey or RGB image with bit depth 8 or 16, as uint8 or
     uint16, shape (height, width) or (height, width, 3). `raw` must already
@@ -444,21 +484,7 @@ def decode_pixels(ihdr: Ihdr, raw: bytes) -> np.ndarray:
 
     if ihdr.color_type not in (0, 2) or ihdr.bit_depth not in (8, 16):
         raise ValueError("only grey and RGB images with 8 or 16 bits are decoded")
-    channels = _CHANNELS[ihdr.color_type]
-    unit = ihdr.filter_unit
-    full = np.zeros((ihdr.height, ihdr.width, unit), dtype=np.uint8)
-    data = np.frombuffer(raw, dtype=np.uint8)
-    pos = 0
-    for x0, y0, dx, dy, w, h in ihdr.passes():
-        size = h * (1 + w * unit)
-        part = _unfilter_pass(data[pos : pos + size], w, h, unit)
-        full[y0::dy, x0::dx] = part
-        pos += size
-    if ihdr.bit_depth == 8:
-        pixels = full.reshape(ihdr.height, ihdr.width, channels)
-    else:
-        pixels = full.reshape(ihdr.height, ihdr.width, channels, 2)
-        pixels = (pixels[..., 0].astype(np.uint16) << 8) | pixels[..., 1]
-    if channels == 1:
+    pixels = decode_samples(ihdr, raw)
+    if ihdr.color_type == 0:
         pixels = pixels[..., 0]
     return np.ascontiguousarray(pixels)
