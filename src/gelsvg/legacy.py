@@ -412,6 +412,16 @@ class Mapped:
     old_svg_hash: str | None
 
 
+def converted_from(old: dict) -> dict:
+    """What the MyWB extension records of the old document a panel was
+    converted from: its schema, and the MyWB that wrote it."""
+
+    integrity = old.get("svg_integrity") if type(old.get("svg_integrity")) is dict else {}
+    written = {k: integrity[o] for k, o in (("name", "generated_by"), ("version", "app_version"), ("build", "build_id"))
+               if isinstance(integrity.get(o), str) and integrity[o]}
+    return {"schema_version": old.get("schema_version"), **({"written_by": written} if written else {})}
+
+
 def from_schema6(old: dict, payloads: dict, *, picture_depth: int | None = None, converted: bool = True) -> Mapped:
     """Map a schema 3–6 JSON by Appendix B. `payloads` maps (codec, SHA-256
     hex) to the old `myWb` payloads (codec 1 plane PNGs, codec 2 metadata).
@@ -422,11 +432,8 @@ def from_schema6(old: dict, payloads: dict, *, picture_depth: int | None = None,
     notes: list[str] = []
     schema = old.get("schema_version")
     extension: dict = {}
-    integrity = old.get("svg_integrity") if type(old.get("svg_integrity")) is dict else {}
     if converted:
-        written = {k: integrity[o] for k, o in (("name", "generated_by"), ("version", "app_version"), ("build", "build_id"))
-                   if isinstance(integrity.get(o), str) and integrity[o]}
-        extension["converted_from"] = {"schema_version": schema, **({"written_by": written} if written else {})}
+        extension["converted_from"] = converted_from(old)
 
     sources, roles, images, metadata = _sources(old, schema, payloads, notes)
     fb, fm = old.get("filter_data_b"), old.get("filter_data_m")
@@ -522,6 +529,7 @@ def from_schema6(old: dict, payloads: dict, *, picture_depth: int | None = None,
             extension.setdefault("svg_style", {})[key] = misc[key]
 
     old_svg_hash = None
+    integrity = old.get("svg_integrity") if type(old.get("svg_integrity")) is dict else {}
     if integrity.get("algorithm") == "sha256" and integrity.get("target") == "svg_c14n2_without_mywb_data" \
             and _hex_hash(integrity.get("hash")):
         old_svg_hash = "sha256:" + integrity["hash"]
