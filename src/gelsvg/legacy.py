@@ -396,25 +396,37 @@ def _rendered(png: bytes):
     return walk, ihdr, _png.decode_pixels(ihdr, raw)
 
 
-def _convert_one(item: _Old, tool: Tool, saved_at: str | None) -> tuple[ConvertedPanel, str | None]:
-    old, notes = item.data, []
-    schema = old.get("schema_version")
-    walk, ihdr, rendered = _rendered(item.png)
-    payloads = {}
-    for chunk in walk.chunks:
-        if chunk.type == b"myWb":
-            got = _gels_like(chunk)
-            if got is None:
-                notes.append("An old myWb chunk was damaged and was not used.")
-            else:
-                payloads[(got[0], hashlib.sha256(got[1]).hexdigest())] = got[1]
+@dataclass
+class Mapped:
+    """A schema 6 JSON (an old MyWB document's, or MyWB's own while it holds a
+    document) as a GelSVG panel: its core, the MyWB extension's content
+    (without `based_on`), and the payloads they point to."""
 
-    extension: dict = {"schema_version": schema}
+    schema_version: int
+    core: dict
+    extension: dict
+    channel_pngs: list[bytes]
+    source_metadata: list[tuple[dict, bytes]]
+    notes: list[str]
+    roi: dict | None
+    old_svg_hash: str | None
+
+
+def from_schema6(old: dict, payloads: dict, *, picture_depth: int | None = None, converted: bool = True) -> Mapped:
+    """Map a schema 3–6 JSON by Appendix B. `payloads` maps (codec, SHA-256
+    hex) to the old `myWb` payloads (codec 1 plane PNGs, codec 2 metadata).
+    `picture_depth` is the old picture's bit depth when there is one: it
+    decides `output_bit_depth`. With `converted`, the extension records the
+    schema and writer converted from."""
+
+    notes: list[str] = []
+    schema = old.get("schema_version")
+    extension: dict = {}
     integrity = old.get("svg_integrity") if type(old.get("svg_integrity")) is dict else {}
-    written = {k: integrity[o] for k, o in (("name", "generated_by"), ("version", "app_version"), ("build", "build_id"))
-               if isinstance(integrity.get(o), str) and integrity[o]}
-    if written:
-        extension["written_by"] = written
+    if converted:
+        written = {k: integrity[o] for k, o in (("name", "generated_by"), ("version", "app_version"), ("build", "build_id"))
+                   if isinstance(integrity.get(o), str) and integrity[o]}
+        extension["converted_from"] = {"schema_version": schema, **({"written_by": written} if written else {})}
 
     sources, roles, images, metadata = _sources(old, schema, payloads, notes)
     fb, fm = old.get("filter_data_b"), old.get("filter_data_m")
@@ -461,13 +473,19 @@ def _convert_one(item: _Old, tool: Tool, saved_at: str | None) -> tuple[Converte
         notes.append("The old ROI could not be read and was dropped.")
 
     misc = old.get("misc_info") if type(old.get("misc_info")) is dict else {}
-    # The old picture was drawn at the output bit depth (old §1.5); an old
-    # reader read "16" for an 8-bit image as 8. The picture decides.
     blot_dtype = next((s.get("dtype") for s in sources if s["id"] == source_b), None)
-    depth = 8 if ihdr.bit_depth == 16 and blot_dtype == "uint8" else ihdr.bit_depth
-    if {"8": 8, "16": 16}.get(misc.get("output_bit_depth"), depth) != depth:
-        notes.append(f"The old output bit depth {misc['output_bit_depth']!r} did not match the picture's "
-                     f"{ihdr.bit_depth} bits; {depth} was used.")
+    stated = {"8": 8, "16": 16}.get(misc.get("output_bit_depth"))
+    if picture_depth is not None:
+        # The old picture was drawn at the output bit depth (old §1.5); an
+        # old reader read "16" for an 8-bit image as 8. The picture decides.
+        depth = 8 if picture_depth == 16 and blot_dtype == "uint8" else picture_depth
+        if stated is not None and stated != depth:
+            notes.append(f"The old output bit depth {misc['output_bit_depth']!r} did not match the picture's "
+                         f"{picture_depth} bits; {depth} was used.")
+    else:
+        # Old §6: missing, unknown, or "16" for an 8-bit image is the image's own depth.
+        own = {"uint8": 8, "uint16": 16}.get(blot_dtype)
+        depth = stated if stated is not None and not (stated == 16 and own == 8) else own or 8
     core["output_bit_depth"] = depth
 
     label_type = misc.get("sample_label_type") if misc.get("sample_label_type") in ("basic", "table", "rotated") else "basic"
@@ -503,28 +521,46 @@ def _convert_one(item: _Old, tool: Tool, saved_at: str | None) -> tuple[Converte
         if schema <= 3 and isinstance(misc.get(key), str):
             extension.setdefault("svg_style", {})[key] = misc[key]
 
-    fallback = (old.get("embedded_png_info") or {}).get("fallback_mode") or item.image.attributes.get("data-mywb-fallback-mode")
-    if fallback == "full-rendered" or roi is None:
-        crop = {"x": 0, "y": 0, "w": ihdr.width, "h": ihdr.height}
-    else:
-        crop = {"x": max(roi["x"], 0), "y": max(roi["y"], 0), "w": ihdr.width, "h": ihdr.height}
-    figure = {"crop": crop, "rendered_hash": _hashes.rendered_hash(rendered), "drawn_from": _hashes.core_hash(core)}
     old_svg_hash = None
     if integrity.get("algorithm") == "sha256" and integrity.get("target") == "svg_c14n2_without_mywb_data" \
             and _hex_hash(integrity.get("hash")):
         old_svg_hash = "sha256:" + integrity["hash"]
-        figure.update(svg_hash=old_svg_hash, svg_hash_method="c14n2_without_panel_data")
-    elif integrity.get("hash"):
+    elif integrity.get("hash") and converted:
         notes.append("The old document's SVG hash was made in a way that cannot be checked again; it was not carried over.")
+    return Mapped(schema, core, extension, [e["payload"] for e in images.values()], list(metadata.values()), notes,
+                  roi, old_svg_hash)
 
-    panel = {"core": core, "figure": figure,
-             "extensions": {MYWB_EXTENSION: {"based_on": _hashes.core_hash(core), "converted_from": extension}}}
+
+def _convert_one(item: _Old, tool: Tool, saved_at: str | None) -> tuple[ConvertedPanel, str | None]:
+    walk, ihdr, rendered = _rendered(item.png)
+    payloads, damaged = {}, []
+    for chunk in walk.chunks:
+        if chunk.type == b"myWb":
+            got = _gels_like(chunk)
+            if got is None:
+                damaged.append("An old myWb chunk was damaged and was not used.")
+            else:
+                payloads[(got[0], hashlib.sha256(got[1]).hexdigest())] = got[1]
+    mapped = from_schema6(item.data, payloads, picture_depth=ihdr.bit_depth)
+    notes = damaged + mapped.notes
+    roi = mapped.roi
+    fallback = (item.data.get("embedded_png_info") or {}).get("fallback_mode") or item.image.attributes.get("data-mywb-fallback-mode")
+    if fallback == "full-rendered" or roi is None:
+        crop = {"x": 0, "y": 0, "w": ihdr.width, "h": ihdr.height}
+    else:
+        crop = {"x": max(roi["x"], 0), "y": max(roi["y"], 0), "w": ihdr.width, "h": ihdr.height}
+    figure = {"crop": crop, "rendered_hash": _hashes.rendered_hash(rendered), "drawn_from": _hashes.core_hash(mapped.core)}
+    if mapped.old_svg_hash:
+        figure.update(svg_hash=mapped.old_svg_hash, svg_hash_method="c14n2_without_panel_data")
+    panel = {"core": mapped.core, "figure": figure,
+             "extensions": {MYWB_EXTENSION: {"based_on": _hashes.core_hash(mapped.core), **mapped.extension}}}
     try:
-        png = _build(Content(panel), tool, saved_at, [], index=None, element=item.image, images=images,
-                     metadata=metadata, kept=_Kept(item.png, walk, figure, legacy=True))
+        png = _build(Content(panel, channel_pngs=mapped.channel_pngs, source_metadata=mapped.source_metadata), tool,
+                     saved_at, [], index=None, element=item.image, images={}, metadata={},
+                     kept=_Kept(item.png, walk, figure, legacy=True))
     except WriteError as exc:
         raise LegacyError(f"The converted panel would not be valid: {exc}", exc.notices) from None
-    return ConvertedPanel(schema, png, notes), old_svg_hash
+    return ConvertedPanel(mapped.schema_version, png, notes), mapped.old_svg_hash
 
 
 # --- finding old documents ---------------------------------------------------------------------

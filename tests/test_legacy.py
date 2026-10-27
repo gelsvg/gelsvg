@@ -229,3 +229,50 @@ def test_a_reversed_contrast_and_an_roi_past_the_edge():
     assert panel.to_json()["core"]["blot"][0]["contrast"] == [0, 255]
     assert panel.figure["crop"] == {"x": 0, "y": 1, "w": 4, "h": 4}
     assert np.array_equal(render(panel.to_json()["core"], panel.channel_images, panel.figure["crop"]), picture)
+
+
+def payloads_of(payloads: dict) -> dict:
+    return {(codec, O.sha(p)): p for codec, items in payloads.items() for p in items}
+
+
+def test_the_mapping_alone_for_a_document_held_in_memory():
+    from gelsvg.legacy import from_schema6
+    doc, payloads = O.base()
+    mapped = from_schema6(doc, payloads_of(payloads), converted=False)
+    assert "converted_from" not in mapped.extension
+    assert mapped.extension["svg_style"] == doc["svg_style"] and mapped.extension["sample_label_type"] == "basic"
+    assert mapped.extension["highlight_saturated"] == {"blot": False, "marker": False}
+    assert mapped.core["output_bit_depth"] == 8 and len(mapped.channel_pngs) == 1 and len(mapped.source_metadata) == 1
+    converted = from_schema6(doc, payloads_of(payloads))
+    assert converted.core == mapped.core and converted.extension["converted_from"] == {"schema_version": 6}
+
+
+@pytest.mark.parametrize("stated, expected", [("8", 8), ("16", 8), (None, 8), ("32", 8)])
+def test_output_bit_depth_without_a_picture(stated, expected):
+    from gelsvg.legacy import from_schema6
+    doc, payloads = O.base()
+    if stated is None:
+        del doc["misc_info"]["output_bit_depth"]
+    else:
+        doc["misc_info"]["output_bit_depth"] = stated
+    assert from_schema6(doc, payloads_of(payloads), converted=False).core["output_bit_depth"] == expected
+
+
+def test_a_new_panel_keeps_channel_pngs_as_given():
+    from gelsvg import Content, default_crop, new_panel, render
+    from gelsvg.legacy import from_schema6
+    doc, payloads = O.base()
+    mapped = from_schema6(doc, payloads_of(payloads), converted=False)
+    pixels = {}
+    from gelsvg._embedded import decode_channel_png
+    from gelsvg import pixel_hash
+    for png in mapped.channel_pngs:
+        image = decode_channel_png(png)[0]
+        pixels[pixel_hash(image)] = image
+    crop = default_crop(mapped.core)
+    png = new_panel(Content({"core": mapped.core, "figure": {"crop": crop}}, rendered=render(mapped.core, pixels, crop),
+                            channel_pngs=mapped.channel_pngs, source_metadata=mapped.source_metadata), TOOL)
+    (panel,) = read(B.svg(B.data_uri(png))).panels
+    assert not [n for n in panel.notices if n.kind in (Kind.BROKEN, Kind.DAMAGED, Kind.UNREADABLE)]
+    (gels,) = [g for g in read(B.svg(B.data_uri(png))).container.panels[0].carrier.gels if g.codec == 1]
+    assert gels.payload == payloads[1][0]

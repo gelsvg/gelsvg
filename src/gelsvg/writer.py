@@ -25,7 +25,7 @@ import xml.etree.ElementTree as ET
 
 import numpy as np
 
-from . import _carrier, _check as C, _datauri, _encode, _hashes, _json, _png, _splice, _svghash, _svgxml
+from . import _carrier, _check as C, _datauri, _embedded, _encode, _hashes, _json, _png, _splice, _svghash, _svgxml
 from ._core import CHANNEL_IMAGE_KIND, CHANNEL_IMAGE_MEDIA
 from .container import read_container
 from .document import Document
@@ -67,14 +67,16 @@ class Content:
     `rendered_hash` and `drawn_from` (§6.4: a changed core then shows the
     figure as older than the data).
 
-    `channel_images` and `source_metadata` are the payloads the JSON points
-    to, beyond what a changed panel already holds: channel images as
-    pixels, source metadata as (catalog entry, payload)."""
+    `channel_images`, `channel_pngs` and `source_metadata` are the payloads
+    the JSON points to, beyond what a changed panel already holds: channel
+    images as pixels, or as channel image PNGs (§5.3) kept byte for byte,
+    and source metadata as (catalog entry, payload)."""
 
     json: dict
     rendered: np.ndarray | None = None
     channel_images: list[np.ndarray] = field(default_factory=list)
     source_metadata: list[tuple[dict, bytes]] = field(default_factory=list)
+    channel_pngs: list[bytes] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -255,6 +257,14 @@ def _build(content: Content, tool: Tool, saved_at: str | None, notes: list[Write
         key = _hashes.pixel_hash(pixels)
         if key not in images:  # a payload already held keeps its bytes
             images[key] = _channel_entry(pixels)
+    for png in content.channel_pngs:
+        pixels, why = _embedded.decode_channel_png(png)
+        if pixels is None:
+            raise WriteError(f"A channel image PNG cannot be embedded: {why}.", index)
+        key = _hashes.pixel_hash(pixels)
+        if key not in images:
+            images[key] = {"dtype": "uint8" if pixels.dtype == np.uint8 else "uint16", "shape": list(pixels.shape),
+                           "byte_length": len(png), "png_hash": _hashes.sha256(png), "payload": png}
     metadata = dict(metadata)
     for entry, payload in content.source_metadata:
         metadata[_hashes.sha256(_json.canonical(entry))] = (entry, payload)
