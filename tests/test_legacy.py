@@ -188,7 +188,8 @@ def test_gelsvg_panels_beside_it_stay_as_they_were():
 
 
 def test_what_cannot_be_converted():
-    with pytest.raises(LegacyError):
+    from gelsvg.legacy import NoOldDocument
+    with pytest.raises(NoOldDocument):
         convert(P.svg_of(P.build()), TOOL)
     doc, payloads = O.base()
     doc["schema_version"] = 7

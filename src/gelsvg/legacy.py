@@ -36,6 +36,10 @@ class LegacyError(ValueError):
         self.notices = list(notices or [])
 
 
+class NoOldDocument(LegacyError):
+    """The file holds no old MyWB document to convert."""
+
+
 @dataclass
 class ConvertedPanel:
     schema_version: int
@@ -573,7 +577,7 @@ def convert(svg: bytes, tool: Tool, *, saved_at: str | None = None) -> Converted
 
     found = _find(svg)
     if not found:
-        raise LegacyError("The file holds no old MyWB document.")
+        raise NoOldDocument("The file holds no old MyWB document.")
     edits, panels, hashes = [], [], []
     for item in found:
         panel, old_hash = _convert_one(item, tool, saved_at)
