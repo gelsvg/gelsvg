@@ -106,10 +106,12 @@ def test_bad_payload_drops_only_the_metadata():
     assert panel.channel_images  # the pixels stay
 
 
-def test_free_form_metadata_is_kept_unread():
+def test_free_form_metadata_is_kept_unread_without_a_report():
+    # A URL this reader does not know is not an unknown format (§5.4).
     panel, key = panel_with_metadata(lambda e: e.update(format="https://vendor.example/meta", version=3))
-    assert panel.core.source_metadata[key]["readable"] is False
-    assert "metadata.free_form" in [n.code for n in panel.notices]
+    record = panel.core.source_metadata[key]
+    assert record["readable"] is False and record["payload"] is not None
+    assert not [n for n in panel.notices if n.kind in (Kind.BROKEN, Kind.UNKNOWN)]
 
 
 @pytest.mark.parametrize("revision", [0, 1])

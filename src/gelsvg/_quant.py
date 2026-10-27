@@ -107,6 +107,8 @@ def read_quantifications(ctx: Context, items: list, view: CoreView) -> list[dict
             q["channel"] = None
         q["inverted"] = o.required("inverted", C.is_bool, "true or false", problems)
         q["computed_on"] = o.required("computed_on", C.is_hash, "a hash", problems)
+        if q["computed_on"] is not None and ctx.hash_error(f"{where}.computed_on", q["computed_on"]):
+            problems.append("'computed_on' uses a hash kind this version does not define")
         values = o.raw("values")
         if type(values) is not list or not values:
             problems.append("'values' is missing or empty")

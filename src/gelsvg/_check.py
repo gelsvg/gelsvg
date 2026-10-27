@@ -111,6 +111,15 @@ class Context:
             return True
         return False
 
+    def hash_error(self, where: str, value: str) -> bool:
+        """§2.2 for a value of the hash type: whether its kind is a writer's
+        error. A kind this reader does not know only cannot be checked in a
+        panel of a newer revision (reported as unknown, rule 2); in a panel
+        of the same or an older revision it is an error in the value (rule
+        1), which the caller handles."""
+
+        return hash_parts(value)[0] != "sha256" and not self.unknown_value(where, value)
+
     def reinterpreted(self, where: str) -> None:
         self.note(Kind.REINTERPRETED, "text.cr",
                   "CR LF and CR were read as LF.", where)

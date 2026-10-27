@@ -92,6 +92,111 @@ def test_unknown_band_shape(revision, kept):
     assert shapes == (["rect", None] if kept else ["rect"])
 
 
+# --- hashes of a kind this version does not define (§2.2) ----------------------------------
+
+FOREIGN = "sha512:" + "ab" * 64
+BY_REVISION = [(0, Kind.BROKEN), (1, Kind.UNKNOWN)]
+
+
+def reported(panel):
+    return kinds(panel, Kind.BROKEN, Kind.UNKNOWN)
+
+
+@pytest.mark.parametrize("revision, kind", BY_REVISION)
+def test_a_quantification_whose_computed_on_is_of_a_foreign_kind(revision, kind):
+    def change(p):
+        p["schema_revision"] = revision
+        p["quantifications"][0]["computed_on"] = FOREIGN
+    panel = read_one(P.build(change, rehash=False))
+    (notice,) = reported(panel)
+    assert notice.kind is kind
+    if revision:  # a newer addition: kept, whether it is stale unknown
+        assert panel.quantifications[0]["stale"] is None
+    else:  # an error in a required key: the quantification is dropped
+        assert panel.quantifications == []
+
+
+@pytest.mark.parametrize("key", ["rendered_hash", "drawn_from", "svg_hash"])
+@pytest.mark.parametrize("revision, kind", BY_REVISION)
+def test_a_figure_hash_of_a_foreign_kind_cannot_be_checked(key, revision, kind):
+    def change(p):
+        p["schema_revision"] = revision
+        p["figure"][key] = FOREIGN
+        if key == "svg_hash":
+            p["figure"]["svg_hash_method"] = "c14n2_without_panel_data"
+    panel = read_one(P.build(change, rehash=False))
+    (notice,) = reported(panel)
+    assert notice.kind is kind and notice.where == f"figure.{key}"
+    assert panel.checks[key] is None
+
+
+@pytest.mark.parametrize("revision, kind", BY_REVISION)
+def test_a_file_hash_of_a_foreign_kind(revision, kind):
+    def change(p):
+        p["schema_revision"] = revision
+        p["core"]["sources"][0]["file_hash"] = FOREIGN
+    panel = read_one(P.build(change))
+    (notice,) = reported(panel)
+    assert notice.kind is kind and notice.where.endswith("file_hash")
+    assert panel.core.sources[0]["file_hash"] == (FOREIGN if revision else None)
+
+
+@pytest.mark.parametrize("revision, kind", BY_REVISION)
+def test_a_channel_image_keyed_by_a_foreign_hash_is_not_used(revision, kind):
+    def change(p):
+        p["schema_revision"] = revision
+        images = p["core"]["embedded"]["channel_images"]
+        (key,) = images
+        images[FOREIGN] = images.pop(key)
+        p["core"]["sources"][0]["channels"][0]["pixel_hash"] = FOREIGN
+    panel = read_one(P.build(change))
+    entry = [n for n in panel.notices if n.where == f"core.embedded.channel_images[{FOREIGN!r}]"]
+    assert [n.kind for n in entry] == [kind]
+    assert panel.channel_images == {}
+
+
+def test_a_source_metadata_pointer_of_a_foreign_kind_is_an_error():
+    panel = read_one(P.build(lambda p: p["core"]["sources"][0].update(source_metadata=FOREIGN)))
+    (notice,) = reported(panel)
+    assert notice.kind is Kind.BROKEN and notice.code == "key.invalid"
+    assert panel.core.sources[0]["source_metadata"] is None
+
+
+@pytest.mark.parametrize("revision, kind", BY_REVISION)
+def test_the_pixel_hash_of_an_average_of_a_foreign_kind(revision, kind):
+    from gelsvg._check import Context
+    from gelsvg._core import read_core
+
+    core = P.base_panel()[0]["core"]
+    del core["embedded"]
+    core["sources"][0]["channels"] = [{"name": c, "pixel_hash": "sha256:" + d * 64}
+                                      for c, d in (("red", "1"), ("green", "2"), ("blue", "3"))]
+    core["blot"][0].update(source_channel="average", pixel_hash=FOREIGN)
+    ctx = Context(panel=0, newer_revision=bool(revision))
+    view = read_core(ctx, core)
+    (notice,) = [n for n in ctx.notices if n.kind in (Kind.BROKEN, Kind.UNKNOWN)]
+    assert notice.kind is kind and notice.where == "core.blot[0].pixel_hash"
+    assert view.blot[0]["pixel_hash"] == (FOREIGN if revision else None)
+
+
+@pytest.mark.parametrize("revision, kind", BY_REVISION)
+def test_based_on_of_a_foreign_kind(revision, kind):
+    def change(p):
+        p["schema_revision"] = revision
+        p["extensions"] = {"https://example.com/tool": {"based_on": FOREIGN}}
+    panel = read_one(P.build(change, rehash=False))
+    (notice,) = reported(panel)
+    assert notice.kind is kind
+    assert panel.extensions["https://example.com/tool"]["based_on"] is None
+
+
+def test_based_on_that_is_not_a_hash_is_reported():
+    panel = read_one(P.build(lambda p: p.update(extensions={"https://example.com/tool": {"based_on": 5}}),
+                             rehash=False))
+    (notice,) = reported(panel)
+    assert notice.kind is Kind.BROKEN
+
+
 # --- rule 3 --------------------------------------------------------------------------------
 
 
@@ -201,10 +306,48 @@ def test_missing_body_after_damage_is_damage():
     assert "embedded.body_damaged" in codes(result)
 
 
+def test_a_body_whose_chunk_type_was_damaged_is_damage():
+    panel, png, rendered = P.base_panel()
+    carrier = bytearray(P.carrier_png(panel, png, rendered))
+    carrier[carrier.index(b"geLs")] ^= 0x20  # geLs -> GeLs: it looks critical, and its CRC no longer matches
+    result = read_one(bytes(carrier))
+    assert "embedded.body_damaged" in codes(result) and "embedded.body_missing" not in codes(result)
+
+
 def test_unreferenced_payload_is_reported():
     panel, png, rendered = P.base_panel()
     result = read_one(P.carrier_png(panel, png, rendered, extra_after=[B.gels(b"stray", codec=2)]))
     assert "embedded.unused" in codes(result)
+
+
+# Whether something refers to an embedding is judged on what is written (§5.3, §5.4).
+
+def test_the_payload_of_a_dropped_entry_is_not_reported_again():
+    def change(p):
+        (entry,) = p["core"]["embedded"]["channel_images"].values()
+        entry["compression"] = "none"  # an unknown key in a closed object
+    panel = read_one(P.build(change))
+    assert [n.code for n in reported(panel)] == ["element.broken"]
+    assert panel.channel_images == {}
+
+
+def test_the_payload_of_an_entry_of_a_newer_kind_is_no_writers_error():
+    def change(p):
+        p["schema_revision"] = 1
+        (entry,) = p["core"]["embedded"]["channel_images"].values()
+        entry["kind"] = "future_plane"
+    panel = read_one(P.build(change))
+    assert [n.kind for n in reported(panel)] == [Kind.UNKNOWN]
+    assert panel.channel_images == {}
+
+
+def test_an_entry_pointed_to_only_by_a_dropped_source_is_not_reported_again():
+    def change(p):
+        p["core"]["sources"].append(dict(copy.deepcopy(p["core"]["sources"][0]), id="s2", shape=[6, 9]))
+        p["core"]["sources"][0]["channels"][0]["pixel_hash"] = "sha256:" + "cd" * 32
+        p["core"]["sources"][1]["dtype"] = "int8"  # the only source left pointing to it is broken
+    panel = read_one(P.build(change))
+    assert [n.where for n in reported(panel)] == ["core.sources[1]"]
 
 
 # --- figure and quantification checks ---------------------------------------------------------
@@ -241,6 +384,33 @@ def test_crop_outside_a_rotated_aligned_image():
         p["figure"]["crop"] = {"x": 3, "y": 3, "w": 8, "h": 6}
     panel = read_one(P.build(change))
     assert panel.figure["crop"] is None and "outside" in " ".join(n.message for n in panel.notices)
+
+
+def _form_notices(panel):
+    return [n for n in panel.notices if n.code.endswith("rendered_form")]
+
+
+def test_a_form_the_writer_got_wrong_is_broken():
+    # One element with a colour draws an RGB picture (§6.2); the grey one was written so.
+    panel = read_one(P.build(lambda p: p["core"]["blot"][0].update(color=[1, 1, 1])))
+    assert panel.checks["rendered_hash"] is True and panel.checks["drawn_from"] is True
+    assert [n.kind for n in _form_notices(panel)] == [Kind.BROKEN]
+
+
+def test_a_form_changed_after_drawing_is_a_check_result():
+    panel, png, rendered = P.base_panel()
+    result = read_one(P.carrier_png(panel, png, np.stack([rendered] * 3, axis=-1)))
+    assert result.checks["rendered_hash"] is False
+    assert [n.kind for n in _form_notices(result)] == [Kind.CHECK]
+
+
+def test_a_size_that_cannot_be_checked_against_rendered_hash_is_broken():
+    def change(p):
+        p["figure"]["crop"]["w"] = 7
+        p["figure"]["rendered_hash"] = "sha512:" + "ab" * 64
+    panel = read_one(P.build(change))
+    assert panel.checks["rendered_hash"] is None
+    assert [n.kind for n in panel.notices if n.where == "figure.crop"] == [Kind.BROKEN]
 
 
 # --- assemblies --------------------------------------------------------------------------------

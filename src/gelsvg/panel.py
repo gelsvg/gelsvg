@@ -201,11 +201,17 @@ def _read_figure(ctx: Context, panel: Panel, figure) -> None:
     for key in ("rendered_hash", "drawn_from"):
         value = o.raw(key)
         if C.is_hash(value):
-            panel.figure[key] = value
+            panel.figure[key] = value  # of a kind not known, it is checked as unknown
+            if ctx.hash_error(f"figure.{key}", value):
+                ctx.broken(f"figure.{key}", f"'{key}' uses a hash kind this version does not define; what it "
+                           "records cannot be checked.", f"figure.{key}")
         else:
             ctx.broken(f"figure.{key}", f"'{key}' is missing or not a hash.", f"figure.{key}")
     svg_hash = o.optional("svg_hash", C.is_hash, "a hash")
     if svg_hash is not None:
+        if ctx.hash_error("figure.svg_hash", svg_hash):
+            ctx.broken("figure.svg_hash", "'svg_hash' uses a hash kind this version does not define; whether the "
+                       "SVG changed cannot be checked.", "figure.svg_hash")
         method = o.raw("svg_hash_method")
         if method in SVG_HASH_METHODS:
             panel.figure["svg_hash"], panel.figure["svg_hash_method"] = svg_hash, method
@@ -256,8 +262,14 @@ def _read_figure(ctx: Context, panel: Panel, figure) -> None:
     if panel.checks.get("drawn_from") and ihdr is not None and view is not None and view.blot is not None:
         expected_type = 2 if any(e.get("color") for e in view.blot) else 0
         if view.output_bit_depth is not None and (ihdr.color_type, ihdr.bit_depth) != (expected_type, view.output_bit_depth):
-            ctx.note(Kind.CHECK, "check.rendered_form", "The rendered image's PNG form does not match the core it was "
-                     "drawn from, so it was changed after it was drawn.")
+            # As for the size of 'crop': only a picture that fails its hash shows it was changed (§6.2).
+            if panel.checks.get("rendered_hash") is False:
+                ctx.note(Kind.CHECK, "check.rendered_form", "The rendered image's PNG form does not match the core it "
+                         "was drawn from, so it was changed after it was drawn.")
+            else:
+                ctx.broken("figure.rendered_form", "The rendered image's PNG form does not match the core it was "
+                           "drawn from, and nothing shows it was changed after it was drawn: it was written so.",
+                           "figure")
 
 
 def _aligned_size(view: CoreView):
@@ -296,6 +308,14 @@ def _read_extensions(ctx: Context, panel: Panel, top: Obj) -> None:
             continue
         record = {"value": content, "based_on": None}
         if "based_on" in content:
+            # §8: one that cannot be read leaves the extension's validity unknown.
+            based_on, w = content["based_on"], f"{where}.based_on"
+            if not C.is_hash(based_on):
+                ctx.broken("extension.based_on", "'based_on' is not a hash; whether the extension still fits the "
+                           "core is unknown.", w)
+            elif ctx.hash_error(w, based_on):
+                ctx.broken("extension.based_on", "'based_on' uses a hash kind this version does not define; whether "
+                           "the extension still fits the core is unknown.", w)
             _check(ctx, panel, f"based_on[{name}]", content["based_on"], panel.core_hash,
                    f"the core changed after the extension {name!r} was written")
             record["based_on"] = panel.checks[f"based_on[{name}]"]

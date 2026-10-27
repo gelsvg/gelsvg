@@ -35,8 +35,9 @@ def _report_chunks(ctx: Context, carrier: Carrier) -> bool:
 
 
 def _missing_body(ctx: Context, carrier: Carrier, unknown_chunks: bool, what: str, where: str) -> None:
+    # A chunk whose CRC does not match, critical or not, may be a geLs whose type was damaged (§5.3).
     lost = carrier.walk.truncated or any(g.status == "damaged" for g in carrier.gels) or any(
-        n.code in ("png.crc.other", "png.truncated") for n in carrier.notices)
+        n.code in ("png.crc.critical", "png.crc.other", "png.truncated") for n in carrier.notices)
     if lost:
         ctx.note(Kind.DAMAGED, "embedded.body_damaged",
                  f"The {what} could not be found; it may have been in a damaged part of the PNG.", where)
@@ -93,8 +94,6 @@ def check_embedded(ctx: Context, view: CoreView, carrier: Carrier, decoded: dict
     unknown_chunks = _report_chunks(ctx, carrier)
     codec1 = {hashlib.sha256(g.payload).hexdigest(): g for g in carrier.gels if g.usable and g.codec == 1}
     codec2 = {hashlib.sha256(g.payload).hexdigest(): g for g in carrier.gels if g.usable and g.codec == 2}
-    used1: set[str] = set()
-    used2: set[str] = set()
 
     users: dict[str, list[dict]] = {}
     for source in view.sources or ():
@@ -106,7 +105,8 @@ def check_embedded(ctx: Context, view: CoreView, carrier: Carrier, decoded: dict
     for key, entry in list(view.channel_images.items()):
         where = f"core.embedded.channel_images[{key!r}]"
         if key not in users:
-            ctx.broken("embedded.unreferenced", "A channel image no channel points to was ignored.", where)
+            if key not in view.pointed_to_written:
+                ctx.broken("embedded.unreferenced", "A channel image no channel points to was ignored.", where)
             del view.channel_images[key]
             continue
         problems = []
@@ -123,7 +123,6 @@ def check_embedded(ctx: Context, view: CoreView, carrier: Carrier, decoded: dict
             del view.channel_images[key]
             continue
         if not problems:
-            used1.add(body)
             if len(payload.payload) != entry["byte_length"]:
                 problems.append("'byte_length' does not match the payload")
         if not problems:
@@ -150,7 +149,8 @@ def check_embedded(ctx: Context, view: CoreView, carrier: Carrier, decoded: dict
     for key, entry in list(view.source_metadata.items()):
         where = f"core.embedded.source_metadata[{key!r}]"
         if key not in metadata_users:
-            ctx.broken("embedded.unreferenced", "Source metadata no source image points to was ignored.", where)
+            if key not in view.pointed_to_written:
+                ctx.broken("embedded.unreferenced", "Source metadata no source image points to was ignored.", where)
             del view.source_metadata[key]
             continue
         problems = []
@@ -168,7 +168,6 @@ def check_embedded(ctx: Context, view: CoreView, carrier: Carrier, decoded: dict
                 del view.source_metadata[key]
                 continue
             if payload is not None:
-                used2.add(body)
                 if len(payload.payload) != entry["byte_length"]:
                     problems.append("'byte_length' does not match the payload")
                 elif entry["readable"]:
@@ -189,9 +188,9 @@ def check_embedded(ctx: Context, view: CoreView, carrier: Carrier, decoded: dict
             ctx.broken("reference.missing", "The source image points to source metadata that does not exist; "
                        "it is read as having no metadata.", f"core.sources[{source['id']!r}].source_metadata")
     for body, g in codec1.items():
-        if body not in used1:
+        if "sha256:" + body not in view.payloads_written[1]:
             ctx.broken("embedded.unused", "A channel image payload no entry uses was ignored.", f"geLs at byte {g.chunk.offset}")
     for body, g in codec2.items():
-        if body not in used2:
+        if "sha256:" + body not in view.payloads_written[2]:
             ctx.broken("embedded.unused", "A source metadata payload no entry uses was ignored.", f"geLs at byte {g.chunk.offset}")
     return images

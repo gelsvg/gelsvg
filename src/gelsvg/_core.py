@@ -46,6 +46,13 @@ class CoreView:
     blot_count_as_written: int = 0
     metadata_keys_written: set[str] = field(default_factory=set)
     """Keys of `embedded.source_metadata` as written, valid or not."""
+    pointed_to_written: set[str] = field(default_factory=set)
+    """Catalog keys that channels and source images point to as written."""
+    payloads_written: dict[int, set[str]] = field(default_factory=lambda: {1: set(), 2: set()})
+    """Payload hashes that catalog entries use as written, by codec. With
+    `pointed_to_written`, what decides whether an embedding is referred to:
+    as written, as in rule 3, so one whose referrer was dropped or not used
+    is not reported again (§5.3, §5.4)."""
     ambiguous: dict[str, set[str]] = field(default_factory=dict)
     """IDs used twice: references to them were dropped (rule 3)."""
 
@@ -136,6 +143,11 @@ def _read_source(ctx: Context, value, where: str):
     out["file_name"] = o.optional("file_name", C.is_str, "a string")
     out["file_hash"] = o.optional("file_hash", C.is_hash, "a hash")
     out["source_metadata"] = o.optional("source_metadata", C.is_hash, "a hash")
+    for key in ("file_hash", "source_metadata"):
+        if out[key] is not None and ctx.hash_error(f"{where}.{key}", out[key]):
+            ctx.broken("key.invalid", f"{key!r} uses a hash kind this version does not define and was ignored.",
+                       f"{where}.{key}")
+            out[key] = None
 
     channels_raw = o.raw("channels")
     channels: list[dict] = []
@@ -205,6 +217,10 @@ def _read_embedded(ctx: Context, core: Obj, view: CoreView) -> None:
     images = o.optional("channel_images", lambda v: type(v) is dict, "an object")
     metadata = o.optional("source_metadata", lambda v: type(v) is dict, "an object")
     o.finish()
+    for codec, entries, key in ((1, images, "png_hash"), (2, metadata, "payload_hash")):
+        for entry in (entries or {}).values():
+            if type(entry) is dict and C.is_hash(entry.get(key)):
+                view.payloads_written[codec].add(entry[key])
     for key, entry in (images or {}).items():
         where = f"core.embedded.channel_images[{key!r}]"
         item, why = _read_image_entry(ctx, key, entry, where)
@@ -292,17 +308,13 @@ def _read_metadata_entry(ctx: Context, key: str, entry, where: str):
         return None, problems
     # An unknown format or version is rule 2 whatever the revision (§5.4):
     # writers carry unread metadata over, also into panels of an older
-    # revision.
-    usable = False
-    if fmt.startswith("https://"):
-        ctx.note(C.Kind.UNKNOWN, "metadata.free_form",
-                 f"Source metadata in the free-form format {fmt!r} is kept but not read.", where)
-    elif fmt not in FORMAL_METADATA or version != 1:
+    # revision. A free-form format is no unknown format: kept unread, and
+    # not reported (§5.4).
+    usable = fmt in FORMAL_METADATA and version == 1
+    if not usable and not fmt.startswith("https://"):
         ctx.note(C.Kind.UNKNOWN, "metadata.unknown",
                  f"Source metadata in a format or version this reader does not know ({fmt!r}, version {version}) "
                  "is kept but not read.", where)
-    else:
-        usable = True
     return {"format": fmt, "version": version, "byte_length": length, "payload_hash": payload_hash,
             "readable": usable, "entry": entry}, []
 
@@ -344,6 +356,10 @@ def _read_view_element(ctx: Context, value, where: str, first: bool, count: int,
             out["color"] = o.optional("color", _color_ok, "three numbers from 0 to 1")
     if out.get("source_channel") == "average":
         out["pixel_hash"] = o.optional("pixel_hash", C.is_hash, "a hash")
+        if out["pixel_hash"] is not None and ctx.hash_error(f"{where}.pixel_hash", out["pixel_hash"]):
+            ctx.broken("key.invalid", "'pixel_hash' uses a hash kind this version does not define and was ignored.",
+                       f"{where}.pixel_hash")
+            out["pixel_hash"] = None
     else:
         o.forbidden("pixel_hash", "only an 'average' element records a pixel hash")
     o.finish()
@@ -519,6 +535,11 @@ def read_core(ctx: Context, raw: dict) -> CoreView:
     if type(sources_raw) is not list:
         view.unreadable.add("sources")
     else:
+        for item in sources_raw:
+            if type(item) is dict:
+                channels = item.get("channels") if type(item.get("channels")) is list else []
+                pointers = [c.get("pixel_hash") for c in channels if type(c) is dict]
+                view.pointed_to_written.update(p for p in [*pointers, item.get("source_metadata")] if C.is_hash(p))
         items = []
         for i, item in enumerate(sources_raw):
             source, why = _read_source(ctx, item, f"core.sources[{i}]")

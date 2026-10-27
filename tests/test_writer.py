@@ -341,7 +341,7 @@ def test_source_metadata_is_carried_over(fmt):
     doc, key, data = with_metadata(fmt)
     p = read(save(doc, TOOL, rewrite={0: edited(doc, 0, lambda d: d["core"].update(note="x"))}).svg).panels[0]
     assert p.core.sources[0]["source_metadata"] == key and p.core.source_metadata[key]["payload"] == data
-    assert not [n for n in problems(p) if n.code != "metadata.free_form"]
+    assert not problems(p)
 
 
 def test_metadata_of_a_newer_version_moves_into_this_revision_unread():

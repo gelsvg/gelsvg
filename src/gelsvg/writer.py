@@ -180,7 +180,7 @@ def _kept_image(panel: Panel) -> None:
         why = "'figure' lacks a value it must have"
     elif panel.checks.get("rendered_hash") is None:
         why = "its rendered image cannot be checked against 'rendered_hash'"
-    elif any(n.code == "check.rendered_form" for n in panel.notices):
+    elif any(n.code in ("check.rendered_form", "figure.rendered_form") for n in panel.notices):
         why = "its rendered image's PNG form does not match the core it was drawn from"
     if why:
         raise WriteError(f"The panel cannot be written with its previous rendered image: {why}. "
@@ -237,7 +237,7 @@ def _with_embedded(core: dict, embedded: dict) -> dict:
 def _problem(notice: Notice) -> bool:
     if notice.kind is Kind.CHECK:
         return notice.code in ("check.rendered_form", "check.crop.size")
-    return notice.code not in ("metadata.free_form", "metadata.unknown")  # carried over unread (§5.4)
+    return notice.code != "metadata.unknown"  # carried over unread (§5.4)
 
 
 def _channel_entry(pixels: np.ndarray) -> dict:
