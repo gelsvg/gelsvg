@@ -56,10 +56,16 @@ def core_for_hash(core) -> object:
 
 
 def core_hash(core) -> str:
+    """§2.7: the whole core's hash, as `drawn_from` and an extension's
+    `based_on` record it."""
+
     return sha256(_json.canonical(core_for_hash(core)))
 
 
 def quant_core_hash(core) -> str:
+    """§2.7: the hash of the core a quantification measures, as its
+    `computed_on` records it."""
+
     out = core_for_hash(core)
     if isinstance(out, dict):
         for path in _QUANT_TEXT:

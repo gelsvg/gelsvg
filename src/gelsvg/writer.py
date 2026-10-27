@@ -239,10 +239,13 @@ def _channel_entry(pixels: np.ndarray) -> dict:
 
 
 def _build(content: Content, tool: Tool, saved_at: str | None, notes: list[WriteNote], *,
-           index: int | None, element, images: dict, metadata: dict, kept: _Kept | None) -> bytes:
+           index: int | None, element, images: dict, metadata: dict, kept: _Kept | None,
+           decoded: dict | None = None) -> bytes:
     """Write the panel's JSON and carrier PNG, and read them back. `images`
     and `metadata` are the payloads already held, by key; `kept` is the
-    rendered image kept when no new one is given."""
+    rendered image kept when no new one is given; `decoded` holds the pixels
+    of payloads already decoded, by the SHA-256 (hex) of their bytes, so
+    reading back need not decode them again."""
 
     data = copy.deepcopy(content.json)
     if type(data) is not dict or type(data.get("core")) is not dict:
@@ -251,12 +254,14 @@ def _build(content: Content, tool: Tool, saved_at: str | None, notes: list[Write
     core.pop("embedded", None)
 
     images = dict(images)
+    decoded = dict(decoded or {})
     for pixels in content.channel_images:
         if pixels.dtype not in (np.uint8, np.uint16) or pixels.ndim != 2 or 0 in pixels.shape:
             raise WriteError("A channel image is a (h, w) image of uint8 or uint16.", index)
         key = _hashes.pixel_hash(pixels)
         if key not in images:  # a payload already held keeps its bytes
             images[key] = _channel_entry(pixels)
+            decoded[images[key]["png_hash"][len("sha256:"):]] = pixels
     for png in content.channel_pngs:
         pixels, why = _embedded.decode_channel_png(png)
         if pixels is None:
@@ -265,6 +270,7 @@ def _build(content: Content, tool: Tool, saved_at: str | None, notes: list[Write
         if key not in images:
             images[key] = {"dtype": "uint8" if pixels.dtype == np.uint8 else "uint16", "shape": list(pixels.shape),
                            "byte_length": len(png), "png_hash": _hashes.sha256(png), "payload": png}
+            decoded[images[key]["png_hash"][len("sha256:"):]] = pixels
     metadata = dict(metadata)
     for entry, payload in content.source_metadata:
         metadata[_hashes.sha256(_json.canonical(entry))] = (entry, payload)
@@ -339,7 +345,7 @@ def _build(content: Content, tool: Tool, saved_at: str | None, notes: list[Write
     # Read it back: what would be written must read without a problem.
     walk = _png.walk(png)
     carrier = _carrier.assess(png, walk, _carrier.find_keyword(walk, _carrier.GELSVG_KEYWORD))
-    check = read_panel(index if index is not None else 0, element, carrier)
+    check = read_panel(index if index is not None else 0, element, carrier, decoded=decoded)
     problems = [n for n in check.notices if _problem(n)]
     if problems:
         raise WriteError("The panel would not be written as the format requires: "
@@ -366,8 +372,10 @@ def rewrite_panel(panel: Panel, content: Content, tool: Tool, *, saved_at: str |
     view = panel.core
     images = {k: e for k, e in view.channel_images.items() if e.get("payload") is not None}
     metadata = {k: (r["entry"], r["payload"]) for k, r in view.source_metadata.items() if r.get("payload") is not None}
+    decoded = {e["png_hash"][len("sha256:"):]: panel.channel_images[k] for k, e in images.items()
+               if k in panel.channel_images and e["png_hash"].startswith("sha256:")}
     png = _build(content, tool, saved_at, notes, index=index, element=panel.element, images=images,
-                 metadata=metadata,
+                 metadata=metadata, decoded=decoded,
                  kept=_Kept(panel.carrier.png, panel.carrier.walk,
                             {k: panel.figure[k] for k in ("crop", "rendered_hash", "drawn_from")}))
     if panel.figure.get("svg_hash") is not None:

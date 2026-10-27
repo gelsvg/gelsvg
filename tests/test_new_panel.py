@@ -149,3 +149,20 @@ def test_a_tool_redraws_the_figure_around_a_changed_and_a_kept_panel():
     new = read(signed)
     assert new.panels[0].checks["svg_hash"] is True and new.panels[0].core.rows[0]["name"] == "p-AKT"
     assert new.container.panels[1].carrier.png == kept
+
+
+def test_reading_back_does_not_decode_the_channel_images_again(monkeypatch):
+    from gelsvg import _embedded, _encode
+    pixels = P.source_pixels()
+    calls = []
+    decode = _embedded.decode_channel_png
+    monkeypatch.setattr(_embedded, "decode_channel_png", lambda png: calls.append(png) or decode(png))
+    new_panel(content(), TOOL)  # from pixels: encoded here, never decoded
+    assert calls == []
+    png = _encode.channel_png(pixels)
+    written = new_panel(content(channel_images=[], channel_pngs=[png]), TOOL)
+    assert calls == [png]  # once, to know its pixels
+    (p,) = read(svg_around(written)).panels
+    calls.clear()
+    rewrite_panel(p, Content(p.to_json()), TOOL)
+    assert calls == []  # the panel read it already

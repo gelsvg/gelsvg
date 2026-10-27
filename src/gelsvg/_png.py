@@ -3,14 +3,18 @@
 Everything here works on bytes and never calls into a PNG library for the
 structure: the specification decides exactly which PNGs are valid, which
 damage is rescued and how far the chunks are walked, and a library's own
-leniency would make the answer depend on its version.
+leniency would make the answer depend on its version. Only undoing the
+filters of scanlines that have passed every check is handed to Pillow, when
+it can, as it is far faster; that arithmetic has one answer.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import io
 import struct
+import warnings
 import zlib
 
 import numpy as np
@@ -446,11 +450,59 @@ def _unpack_bits(rows: np.ndarray, bit_depth: int, width: int) -> np.ndarray:
     return values.reshape(rows.shape[0], rows.shape[1] * per_byte)[:, :width].astype(np.uint8)
 
 
+def _chunk(chunk_type: bytes, data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", zlib.crc32(chunk_type + data) & 0xFFFFFFFF)
+
+
+_PILLOW_FORMS = {(0, 8): ("L",), (0, 16): ("I;16", "I;16B", "I"), (2, 8): ("RGB",)}
+
+
+def _pillow_samples(ihdr: Ihdr, raw: bytes) -> np.ndarray | None:
+    """The samples Pillow rebuilds from scanlines that passed
+    `scanline_problem`, handed to it in a PNG of just those scanlines; or None
+    when it cannot give them exactly (other forms, interlaced, Pillow
+    missing, too large for it), so the caller rebuilds them itself."""
+
+    forms = _PILLOW_FORMS.get((ihdr.color_type, ihdr.bit_depth))
+    if forms is None or ihdr.interlace != 0 or len(raw) > 2**31 - 100:
+        return None
+    try:
+        from PIL import Image
+    except ImportError:
+        return None
+    header = struct.pack(">IIBBBBB", ihdr.width, ihdr.height, ihdr.bit_depth, ihdr.color_type, 0, 0, 0)
+    png = PNG_SIGNATURE + _chunk(b"IHDR", header) + _chunk(b"IDAT", zlib.compress(raw, 0)) + _chunk(b"IEND", b"")
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(png), formats=("PNG",)) as image:
+                if image.mode not in forms or image.size != (ihdr.width, ihdr.height):
+                    return None
+                image.load()
+                pixels = np.asarray(image)
+    except Exception:  # Pillow's own limits: rebuild it here instead
+        return None
+    channels = _CHANNELS[ihdr.color_type]
+    if pixels.shape != ((ihdr.height, ihdr.width) if channels == 1 else (ihdr.height, ihdr.width, channels)):
+        return None
+    dtype = np.uint16 if ihdr.bit_depth == 16 else np.uint8
+    if pixels.dtype != dtype and (pixels.dtype.kind not in "iu" or pixels.min() < 0 or pixels.max() > np.iinfo(dtype).max):
+        return None
+    return np.ascontiguousarray(pixels.astype(dtype, copy=False).reshape(ihdr.height, ihdr.width, channels))
+
+
 def decode_samples(ihdr: Ihdr, raw: bytes) -> np.ndarray:
     """The stored samples of any colour type and bit depth, shape (height,
     width, samples per pixel): uint16 for 16 bits, else uint8 (fewer than 8
     bits are not widened). `raw` must already have passed
     `scanline_problem`."""
+
+    fast = _pillow_samples(ihdr, raw)
+    return fast if fast is not None else _rebuilt_samples(ihdr, raw)
+
+
+def _rebuilt_samples(ihdr: Ihdr, raw: bytes) -> np.ndarray:
+    """decode_samples, every filter undone here."""
 
     channels = _CHANNELS[ihdr.color_type]
     data = np.frombuffer(raw, dtype=np.uint8)

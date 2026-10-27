@@ -149,6 +149,31 @@ def test_decode_matches_the_pixels_for_every_filter(depth, rgb, interlace):
     assert np.array_equal(_png.decode_pixels(ihdr, raw), pixels)
 
 
+@pytest.mark.parametrize("depth", [8, 16])
+@pytest.mark.parametrize("rgb", [False, True])
+@pytest.mark.parametrize("shape", [(9, 11), (1, 1), (1, 7), (6, 1), (40, 33)])
+def test_both_ways_of_undoing_the_filters_agree(depth, rgb, shape):
+    height, width = shape
+    pixels = B.small_pixels(height=height, width=width, rgb=rgb, depth=depth, seed=height * width + depth + rgb)
+    raw = B.scanlines(pixels, depth, [(r * 3 + 1) % 5 for r in range(height)], 0)
+    ihdr = _png.Ihdr(width, height, depth, 2 if rgb else 0, 0, 0, 0)
+    channels = 3 if rgb else 1
+    rebuilt = _png._rebuilt_samples(ihdr, raw)
+    assert np.array_equal(rebuilt.reshape(pixels.shape), pixels)
+    by_pillow = _png._pillow_samples(ihdr, raw)
+    if depth == 16 and rgb:
+        assert by_pillow is None  # Pillow keeps only 8 bits of 16-bit RGB
+    else:
+        assert by_pillow.dtype == rebuilt.dtype and by_pillow.shape == (height, width, channels)
+        assert np.array_equal(by_pillow, rebuilt)
+
+
+def test_interlaced_scanlines_are_undone_here():
+    pixels = B.small_pixels(height=9, width=11, seed=5)
+    ihdr = _png.Ihdr(11, 9, 8, 0, 0, 0, 1)
+    assert _png._pillow_samples(ihdr, B.scanlines(pixels, 8, "cycle", 1)) is None
+
+
 def test_decode_agrees_with_pillow_for_grey_16():
     pixels = B.small_pixels(height=6, width=7, depth=16, seed=3)
     png = B.image_png(pixels, depth=16, filters=[4, 3, 1, 2, 0, 4])

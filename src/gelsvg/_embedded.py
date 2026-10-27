@@ -84,9 +84,11 @@ def decode_channel_png(payload: bytes):
     return _png.decode_pixels(ihdr, raw), None
 
 
-def check_embedded(ctx: Context, view: CoreView, carrier: Carrier) -> dict:
+def check_embedded(ctx: Context, view: CoreView, carrier: Carrier, decoded: dict | None = None) -> dict:
     """Verify every catalog entry against its payload. Returns the decoded
-    channel images by pixel hash (only those that passed)."""
+    channel images by pixel hash (only those that passed). `decoded` holds
+    channel image PNGs already decoded, by the SHA-256 (hex) of their bytes:
+    the writer reading back what it wrote, which need not decode them again."""
 
     unknown_chunks = _report_chunks(ctx, carrier)
     codec1 = {hashlib.sha256(g.payload).hexdigest(): g for g in carrier.gels if g.usable and g.codec == 1}
@@ -125,7 +127,7 @@ def check_embedded(ctx: Context, view: CoreView, carrier: Carrier) -> dict:
             if len(payload.payload) != entry["byte_length"]:
                 problems.append("'byte_length' does not match the payload")
         if not problems:
-            pixels, why = decode_channel_png(payload.payload)
+            pixels, why = (decoded[body], None) if decoded and body in decoded else decode_channel_png(payload.payload)
             if pixels is None:
                 problems.append(f"its PNG is not a valid channel image ({why})")
             else:

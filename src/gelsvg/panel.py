@@ -89,7 +89,7 @@ def _check(ctx: Context, panel: Panel, name: str, recorded, actual: str | None, 
         ctx.note(Kind.CHECK, f"check.{name}.differs", f"Checked whether {what}: it has.")
 
 
-def read_panel(index: int, element: Element, carrier: Carrier) -> Panel:
+def read_panel(index: int, element: Element, carrier: Carrier, *, decoded: dict | None = None) -> Panel:
     panel = Panel(index=index, element=element, carrier=carrier, notices=list(carrier.notices))
 
     def unreadable(reason: str) -> Panel:
@@ -156,7 +156,7 @@ def read_panel(index: int, element: Element, carrier: Carrier) -> Panel:
 
     view = read_core(ctx, raw["core"])
     panel.core = view
-    panel.channel_images = _embedded.check_embedded(ctx, view, carrier)
+    panel.channel_images = _embedded.check_embedded(ctx, view, carrier, decoded)
     panel.core_hash = _hashes.core_hash(raw["core"])
     panel.quant_hash = _hashes.quant_core_hash(raw["core"])
 
