@@ -67,6 +67,11 @@ class Content:
     `rendered_hash` and `drawn_from` (§6.4: a changed core then shows the
     figure as older than the data).
 
+    `invert_kept`, for a changed panel with no `rendered`: its previous
+    rendered image is kept with its values inverted (the type's maximum −
+    value), as §6.2 allows when the channel images cannot be had; its
+    `rendered_hash` is computed again and `drawn_from` is kept.
+
     `channel_images`, `channel_pngs` and `source_metadata` are the payloads
     the JSON points to, beyond what a changed panel already holds: channel
     images as pixels, or as channel image PNGs (§5.3) kept byte for byte,
@@ -77,6 +82,7 @@ class Content:
     channel_images: list[np.ndarray] = field(default_factory=list)
     source_metadata: list[tuple[dict, bytes]] = field(default_factory=list)
     channel_pngs: list[bytes] = field(default_factory=list)
+    invert_kept: bool = False
 
 
 @dataclass(frozen=True)
@@ -184,12 +190,14 @@ def _kept_image(panel: Panel) -> None:
 @dataclass
 class _Kept:
     """A rendered image kept as it was: its PNG, and the figure record that
-    goes with it. `legacy` also drops an old MyWB carrier's data."""
+    goes with it, and its pixels. `legacy` also drops an old MyWB carrier's
+    data."""
 
     png: bytes
     walk: _png.Walk
     figure: dict
     legacy: bool = False
+    pixels: np.ndarray | None = None
 
 
 def _kept_image_png(kept: _Kept, itxt: bytes, gels: bytes) -> bytes:
@@ -297,8 +305,13 @@ def _build(content: Content, tool: Tool, saved_at: str | None, notes: list[Write
         core = _with_embedded(core, embedded)
 
     # The figure record.
+    redrawn = content.rendered
     if content.rendered is None:
         figure = copy.deepcopy(kept.figure)
+        if content.invert_kept:
+            # §6.2: the kept picture's values turned over, its hash taken again.
+            redrawn = np.iinfo(kept.pixels.dtype).max - kept.pixels
+            figure["rendered_hash"] = _hashes.rendered_hash(redrawn)
     else:
         pixels = content.rendered
         if (pixels.dtype not in (np.uint8, np.uint16) or pixels.ndim not in (2, 3)
@@ -336,10 +349,10 @@ def _build(content: Content, tool: Tool, saved_at: str | None, notes: list[Write
     itxt = _encode.itxt(text)
     gels = _encode.gels_chunks([images[k]["payload"] for k in image_catalog],
                                [metadata[k][1] for k in metadata_catalog])
-    if content.rendered is None:
+    if redrawn is None:
         png = _kept_image_png(kept, itxt, gels)
     else:
-        header, stream = _encode.encode_image(content.rendered)
+        header, stream = _encode.encode_image(redrawn)
         png = _png.PNG_SIGNATURE + header + itxt + _encode.idat_chunks(stream) + gels + _encode.IEND
 
     # Read it back: what would be written must read without a problem.
@@ -369,6 +382,11 @@ def rewrite_panel(panel: Panel, content: Content, tool: Tool, *, saved_at: str |
                          "Pass allow_loss=True to go ahead.", index)
     if content.rendered is None:
         _kept_image(panel)
+        if content.invert_kept and panel.checks.get("rendered_hash") is not True:
+            raise WriteError("The panel's rendered image does not match its 'rendered_hash', so its pixels must not "
+                             "be changed (§6.2).", index)
+    elif content.invert_kept:
+        raise WriteError("Content.invert_kept keeps the previous rendered image; it cannot go with a new one.", index)
     view = panel.core
     images = {k: e for k, e in view.channel_images.items() if e.get("payload") is not None}
     metadata = {k: (r["entry"], r["payload"]) for k, r in view.source_metadata.items() if r.get("payload") is not None}
@@ -377,7 +395,8 @@ def rewrite_panel(panel: Panel, content: Content, tool: Tool, *, saved_at: str |
     png = _build(content, tool, saved_at, notes, index=index, element=panel.element, images=images,
                  metadata=metadata, decoded=decoded,
                  kept=_Kept(panel.carrier.png, panel.carrier.walk,
-                            {k: panel.figure[k] for k in ("crop", "rendered_hash", "drawn_from")}))
+                            {k: panel.figure[k] for k in ("crop", "rendered_hash", "drawn_from")},
+                            pixels=panel.rendered))
     if panel.figure.get("svg_hash") is not None:
         notes.append(WriteNote("svg_hash.removed", "The panel's svg_hash was left out: it recorded the SVG as an "
                                "earlier writer wrote it (§6.5).", index))

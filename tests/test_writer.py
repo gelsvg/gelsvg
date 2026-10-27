@@ -147,6 +147,41 @@ def test_a_new_rendered_image():
     assert p.figure["crop"] == {"x": 2, "y": 1, "w": 5, "h": 4} and np.array_equal(p.rendered, pixels)
 
 
+def test_the_kept_rendered_image_inverted():
+    # §6.2: without the channel images, the previous picture may be kept with
+    # its values turned over; its hash is taken again, drawn_from kept.
+    doc = two_panel_doc()
+    before = doc.panels[0]
+    rewrite = edited(doc, 0, lambda d: d["core"]["blot"][0].update(invert=not d["core"]["blot"][0]["invert"]))
+    rewrite.invert_kept = True
+    p = read(save(doc, TOOL, rewrite={0: rewrite}).svg).panels[0]
+    assert not problems(p)
+    assert np.array_equal(p.rendered, np.iinfo(before.rendered.dtype).max - before.rendered)
+    assert p.checks["rendered_hash"] is True
+    assert p.figure["drawn_from"] == before.figure["drawn_from"] and p.checks["drawn_from"] is False
+    assert p.figure["crop"] == before.figure["crop"]
+
+
+def test_a_kept_rendered_image_changed_after_drawing_is_not_inverted():
+    doc = two_panel_doc()
+    png = doc.container.panels[0].carrier.png
+    walk = _png.walk(png)
+    ihdr = _png.Ihdr.parse(walk.chunks[0].data)
+    pixels = _png.decode_pixels(ihdr, _png.inflate_complete(b"".join(c.data for c in walk.chunks if c.type == b"IDAT")))
+    pixels = pixels.copy()
+    pixels[0, 0] ^= 1  # painted on after it was drawn
+    header, stream = _encode.encode_image(pixels)
+    painted = (_png.PNG_SIGNATURE + header + b"".join(png[c.offset : c.offset + 12 + c.length] for c in walk.chunks
+                                                     if c.type not in (b"IHDR", b"IDAT", b"IEND"))
+               + _encode.idat_chunks(stream) + _encode.IEND)
+    doc = read(doc.svg.replace(B.data_uri(png).encode(), B.data_uri(painted).encode(), 1))
+    assert doc.panels[0].checks["rendered_hash"] is False
+    rewrite = edited(doc, 0, lambda d: None)
+    rewrite.invert_kept = True
+    with pytest.raises(WriteError, match="must not be changed"):
+        save(doc, TOOL, rewrite={0: rewrite})
+
+
 def test_svg_hash_of_kept_panels_still_matches():
     unsigned = P.svg_of(P.build(), P.build())
     value = _svghash.svg_hash(unsigned)
