@@ -814,6 +814,44 @@ def test_what_a_quantification_may_depend_on_is_in_its_hash(change):
     assert _hashes.quant_core_hash(core) != before
 
 
+def _core_with_marker():
+    core = P.base_panel()[0]["core"]
+    marker = channel("m1")
+    marker["role"] = "marker"
+    core["channels"].append(marker)
+    return core
+
+
+@pytest.mark.parametrize("change", [
+    lambda core: core["channels"].pop(),
+    lambda core: core["channels"][1].update(source_channel="red", turn=90, flip=True),
+    lambda core: core["channels"][1].update(role="marker", id="m2"),
+    lambda core: core["channels"].append({**channel("m3"), "role": "marker"}),
+])
+def test_a_marker_channel_is_not_in_the_hash_for_quantification(change):
+    from gelsvg import _hashes
+
+    core = _core_with_marker()
+    before, whole = _hashes.quant_core_hash(core), _hashes.core_hash(core)
+    change(core)
+    assert _hashes.quant_core_hash(core) == before and _hashes.core_hash(core) != whole
+
+
+@pytest.mark.parametrize("measured", ["reference", "row"])
+def test_a_marker_channel_that_is_measured_stays_in_the_hash(measured):
+    from gelsvg import _hashes
+
+    core = _core_with_marker()
+    if measured == "reference":
+        core["reference_channel"] = "m1"
+        core["channels"][1].update(role="marker")
+    else:
+        core["rows"] = [{"id": "r1", "channel": "m1"}]
+    before = _hashes.quant_core_hash(core)
+    core["channels"][-1].update(turn=90)
+    assert _hashes.quant_core_hash(core) != before
+
+
 def region_mode(p):
     q = p["quantifications"][0]
     q["mode"] = "region"

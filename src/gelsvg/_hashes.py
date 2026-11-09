@@ -62,12 +62,31 @@ def core_hash(core) -> str:
     return sha256(_json.canonical(core_for_hash(core)))
 
 
+def _drop_marker_channels(out: dict) -> None:
+    """§2.7: marker channels are not measured, so they stay out of the hash,
+    unless the reference channel or a row points to one."""
+
+    channels = out.get("channels")
+    if not isinstance(channels, list):
+        return
+    kept = {out.get("reference_channel")}
+    rows = out.get("rows")
+    if isinstance(rows, list):
+        kept.update(row.get("channel") for row in rows if isinstance(row, dict))
+    out["channels"] = [
+        element for element in channels
+        if not (isinstance(element, dict) and element.get("role") == "marker"
+                and not (isinstance(element.get("id"), (str, int)) and element["id"] in kept))
+    ]
+
+
 def quant_core_hash(core) -> str:
     """§2.7: the hash of the core a quantification measures, as its
     `computed_on` records it."""
 
     out = core_for_hash(core)
     if isinstance(out, dict):
+        _drop_marker_channels(out)
         for path in _QUANT_TEXT:
             if len(path) == 2:
                 _drop_in_array(out, path[0], path[1])
