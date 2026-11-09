@@ -103,7 +103,7 @@ def test_bad_payload_drops_only_the_metadata():
     panel, key = panel_with_metadata(lambda e: e.update(byte_length=len(data),
                                                         payload_hash="sha256:" + hashlib.sha256(data).hexdigest()), body=data)
     assert key not in panel.core.source_metadata
-    assert panel.channel_images  # the pixels stay
+    assert panel.source_channel_images  # the pixels stay
 
 
 def test_free_form_metadata_is_kept_unread_without_a_report():

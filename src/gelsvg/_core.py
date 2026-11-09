@@ -17,8 +17,10 @@ from ._check import Context, Obj
 DTYPES = ("uint8", "uint16")
 TURNS = (0, 90, 180, 270)
 RGB_NAMES = {"red", "green", "blue"}
-SIZE_UNITS = ("kDa", "bp", "kb", "nt")
 BAND_SHAPES = ("rect", "point")
+ROLES = ("marker",)
+BLENDS = ("add",)
+ANNOTATION_SIDES = ("left", "right", "top", "bottom")
 CHANNEL_IMAGE_KIND = "decoded_scalar_plane"
 CHANNEL_IMAGE_MEDIA = "image/png"
 FORMAL_METADATA = ("png", "jpeg", "tiff", "scn")
@@ -27,10 +29,16 @@ FORMAL_METADATA = ("png", "jpeg", "tiff", "scn")
 @dataclass
 class CoreView:
     sources: list[dict] | None = None
-    channel_images: dict[str, dict] = field(default_factory=dict)
+    source_channel_images: dict[str, dict] = field(default_factory=dict)
     source_metadata: dict[str, dict] = field(default_factory=dict)
-    blot: list[dict] | None = None
-    marker: dict | None = None
+    channels: list[dict] | None = None
+    """The panel channels (§5.6), or None when `channels` cannot be read (rule 4)."""
+    reference_channel: str | None = None
+    """The reference channel's ID (§5.7), or None when it cannot be read (rule 4)."""
+    blend: str | None = None
+    """`blend` as written (§5.6); None when absent (`add`) or of a newer value."""
+    blend_unknown: bool = False
+    """`blend` has a value of a newer revision: the rendered image cannot be drawn again (rule 2)."""
     orientation: dict | None = None
     roi: dict | None = None
     output_bit_depth: int | None = None
@@ -39,15 +47,18 @@ class CoreView:
     rows: list[dict] = field(default_factory=list)
     bands: list[dict] = field(default_factory=list)
     markers: list[dict] = field(default_factory=list)
-    annotation: str | None = None
+    marker_unit: str | None = None
+    """The unit of the marker labels' numbers, as written (§5.14)."""
+    annotations: dict[str, str] = field(default_factory=dict)
+    """The text of each side that has one (§5.15), in ANNOTATION_SIDES order."""
     note: str | None = None
     unreadable: set[str] = field(default_factory=set)
     """Required core keys that could not be read (rule 4)."""
-    blot_count_as_written: int = 0
+    drawn_count_as_written: int = 0
     metadata_keys_written: set[str] = field(default_factory=set)
     """Keys of `embedded.source_metadata` as written, valid or not."""
     pointed_to_written: set[str] = field(default_factory=set)
-    """Catalog keys that channels and source images point to as written."""
+    """Catalog keys that source channels and source images point to as written."""
     payloads_written: dict[int, set[str]] = field(default_factory=lambda: {1: set(), 2: set()})
     """Payload hashes that catalog entries use as written, by codec. With
     `pointed_to_written`, what decides whether an embedding is referred to:
@@ -68,8 +79,27 @@ class CoreView:
     def row_ids(self) -> set[str]:
         return {row["id"] for row in self.rows}
 
-    def blot_ids(self) -> set[str]:
-        return {e["id"] for e in self.blot or ()}
+    def channel(self, channel_id: str) -> dict | None:
+        for element in self.channels or ():
+            if element["id"] == channel_id:
+                return element
+        return None
+
+    def channel_ids(self) -> set[str]:
+        return {e["id"] for e in self.channels or ()}
+
+    def reference(self) -> dict | None:
+        """The reference channel, while `reference_channel` can be read."""
+
+        return None if self.reference_channel is None else self.channel(self.reference_channel)
+
+    def drawn(self) -> list[dict]:
+        """The panel channels drawn into the rendered image, in their order (§6.2)."""
+
+        return [e for e in self.channels or () if e["drawn"]]
+
+    def marker_channels(self) -> list[dict]:
+        return [e for e in self.channels or () if e["role"] == "marker"]
 
     def band_cells(self) -> set[tuple[str, str]]:
         return {(b["lane"], b["row"]) for b in self.bands}
@@ -84,21 +114,42 @@ def _array(ctx: Context, core: Obj, key: str) -> list:
     return value or []
 
 
-def _dedupe_ids(ctx: Context, items: list[tuple[int, dict]], what: str, where: str) -> tuple[list[tuple[int, dict]], set[str]]:
-    """Keep the first element of each ID; drop the later ones and make the
-    ID unusable as a reference target (rule 3)."""
+def _ids_as_written(raw: list) -> list:
+    """Each element's ID as written, by place (None where none can be read)."""
 
-    seen: dict[str, int] = {}
-    ambiguous: set[str] = set()
+    return [item.get("id") if type(item) is dict and C.is_id(item.get("id")) else None for item in raw]
+
+
+def _firsts(keys: list) -> tuple[dict, set]:
+    """Where each key is first written, and the keys written more than once."""
+
+    first, twice = {}, set()
+    for index, key in enumerate(keys):
+        if key is None:
+            continue
+        if key in first:
+            twice.add(key)
+        else:
+            first[key] = index
+    return first, twice
+
+
+def _dedupe_ids(ctx: Context, items: list[tuple[int, dict]], what: str, where: str,
+                written: list) -> tuple[list[tuple[int, dict]], set[str]]:
+    """Keep the element first written with each ID; drop the later ones and
+    make the ID unusable as a reference target (rule 3). Overlaps are judged
+    on the IDs as written (`written`, the array as written), before anything
+    is dropped: a later element is dropped even when the earlier one is
+    broken, and an ID written twice stays unusable."""
+
+    first, ambiguous = _firsts(_ids_as_written(written))
     kept = []
     for index, item in items:
         ident = item["id"]
-        if ident in seen:
-            ambiguous.add(ident)
+        if first.get(ident, index) != index:
             ctx.broken("id.duplicate", f"A later {what} with the ID {ident!r} was dropped, "
                        "and so is everything pointing to that ID.", f"{where}[{index}]")
             continue
-        seen[ident] = index
         kept.append((index, item))
     return kept, ambiguous
 
@@ -106,7 +157,7 @@ def _dedupe_ids(ctx: Context, items: list[tuple[int, dict]], what: str, where: s
 # --- sources and embedded ----------------------------------------------------------
 
 
-def _read_channel(ctx: Context, value, where: str):
+def _read_source_channel(ctx: Context, value, where: str):
     if type(value) is not dict:
         return None, ["not an object"]
     o = Obj(ctx, value, where)
@@ -149,28 +200,27 @@ def _read_source(ctx: Context, value, where: str):
                        f"{where}.{key}")
             out[key] = None
 
-    channels_raw = o.raw("channels")
+    channels_raw = o.raw("source_channels")
     channels: list[dict] = []
     if type(channels_raw) is not list or not channels_raw:
-        problems.append("'channels' is missing or empty")
+        problems.append("'source_channels' is missing or empty")
     else:
-        names: set[str] = set()
-        out["ambiguous_channels"] = set()
+        # Names written twice are judged as written, as IDs are (rule 3).
+        first, out["ambiguous_channels"] = _firsts([
+            item.get("name") if type(item) is dict and C.is_str(item.get("name")) else None for item in channels_raw])
         for i, item in enumerate(channels_raw):
-            channel, why = _read_channel(ctx, item, f"{where}.channels[{i}]")
+            channel, why = _read_source_channel(ctx, item, f"{where}.source_channels[{i}]")
             if channel is None:
-                _broken(ctx, "channel", f"{where}.channels[{i}]", why)
+                _broken(ctx, "source channel", f"{where}.source_channels[{i}]", why)
                 continue
-            if channel["name"] in names:
-                out["ambiguous_channels"].add(channel["name"])
-                ctx.broken("channel.duplicate", f"A later channel named {channel['name']!r} was dropped, and so is "
-                           "every element choosing that name.", f"{where}.channels[{i}]")
+            if first.get(channel["name"], i) != i:
+                ctx.broken("channel.duplicate", f"A later source channel named {channel['name']!r} was dropped, and "
+                           "so is every panel channel choosing that name.", f"{where}.source_channels[{i}]")
                 continue
-            names.add(channel["name"])
             channels.append(channel)
         if not channels:
-            problems.append("no channel can be read")
-    out["channels"] = channels
+            problems.append("no source channel can be read")
+    out["source_channels"] = channels
 
     has_pixels = any("pixel_hash" in c for c in channels)
     dtype = None
@@ -185,7 +235,7 @@ def _read_source(ctx: Context, value, where: str):
         else:
             ctx.broken("key.invalid", "'dtype' is not uint8 or uint16 and was ignored.", f"{where}.dtype")
     elif has_pixels:
-        problems.append("'dtype' is missing although a channel has a pixel hash")
+        problems.append("'dtype' is missing although a source channel has a pixel hash")
     shape = None
     if o.has("shape"):
         v = o.raw("shape")
@@ -196,7 +246,7 @@ def _read_source(ctx: Context, value, where: str):
         else:
             ctx.broken("key.invalid", "'shape' is not [height, width] and was ignored.", f"{where}.shape")
     elif has_pixels:
-        problems.append("'shape' is missing although a channel has a pixel hash")
+        problems.append("'shape' is missing although a source channel has a pixel hash")
     out["dtype"], out["shape"] = dtype, shape
     o.finish()
     if problems:
@@ -205,8 +255,22 @@ def _read_source(ctx: Context, value, where: str):
 
 
 def _is_rgb(source: dict) -> bool:
-    names = [c["name"] for c in source["channels"]]
+    names = [c["name"] for c in source["source_channels"]]
     return len(names) == 3 and set(names) == RGB_NAMES
+
+
+def _read_annotations(ctx: Context, core: Obj) -> dict[str, str]:
+    value = core.optional("annotations", lambda v: type(v) is dict, "an object")
+    if value is None:
+        return {}
+    o = Obj(ctx, value, "core.annotations")
+    sides = {}
+    for side in ANNOTATION_SIDES:
+        text = o.optional(side, C.is_str, "a string")
+        if text is not None:
+            sides[side] = text
+    o.finish()
+    return sides
 
 
 def _read_embedded(ctx: Context, core: Obj, view: CoreView) -> None:
@@ -214,7 +278,7 @@ def _read_embedded(ctx: Context, core: Obj, view: CoreView) -> None:
     if value is None:
         return
     o = Obj(ctx, value, "core.embedded")
-    images = o.optional("channel_images", lambda v: type(v) is dict, "an object")
+    images = o.optional("source_channel_images", lambda v: type(v) is dict, "an object")
     metadata = o.optional("source_metadata", lambda v: type(v) is dict, "an object")
     o.finish()
     for codec, entries, key in ((1, images, "png_hash"), (2, metadata, "payload_hash")):
@@ -222,13 +286,13 @@ def _read_embedded(ctx: Context, core: Obj, view: CoreView) -> None:
             if type(entry) is dict and C.is_hash(entry.get(key)):
                 view.payloads_written[codec].add(entry[key])
     for key, entry in (images or {}).items():
-        where = f"core.embedded.channel_images[{key!r}]"
+        where = f"core.embedded.source_channel_images[{key!r}]"
         item, why = _read_image_entry(ctx, key, entry, where)
         if item is None:
             if why:
-                _broken(ctx, "channel image entry", where, why)
+                _broken(ctx, "source channel image entry", where, why)
             continue
-        view.channel_images[key] = item
+        view.source_channel_images[key] = item
     view.metadata_keys_written = set(metadata or {})
     for key, entry in (metadata or {}).items():
         where = f"core.embedded.source_metadata[{key!r}]"
@@ -319,7 +383,7 @@ def _read_metadata_entry(ctx: Context, key: str, entry, where: str):
             "readable": usable, "entry": entry}, []
 
 
-# --- blot and marker ------------------------------------------------------------------
+# --- panel channels ---------------------------------------------------------------------
 
 
 def _contrast_ok(v) -> bool:
@@ -330,40 +394,93 @@ def _color_ok(v) -> bool:
     return type(v) is list and len(v) == 3 and all(C.is_number(x) and 0 <= x <= 1 for x in v)
 
 
-def _read_view_element(ctx: Context, value, where: str, first: bool, count: int, marker: bool):
+def _read_panel_channel(ctx: Context, value, where: str, reference: bool | None, drawn_count: int):
+    """One panel channel (§5.6). `reference` says whether it is the
+    reference channel, or is None when `reference_channel` cannot be read:
+    then whether `turn` and `flip` are needed is not checked (rule 4).
+    `drawn_count` is how many panel channels are drawn, as written."""
+
     if type(value) is not dict:
         return None, ["not an object"]
     o = Obj(ctx, value, where)
     problems: list[str] = []
-    out: dict = {}
-    if not marker:
-        out["id"] = o.required("id", C.is_id, "an ID", problems)
+    out: dict = {"id": o.required("id", C.is_id, "an ID", problems), "name": o.optional("name", C.is_str, "a string")}
+    role = o.optional("role", C.is_str, "a string")
+    if role is not None and role not in ROLES and not ctx.unknown_value(f"{where}.role", role):
+        ctx.broken("key.invalid", f"'role' has the value {role!r} and was ignored.", f"{where}.role")
+        role = None
+    out["role"] = role  # a newer role is kept: neither an ordinary nor a marker channel (rule 2)
+    out["drawn"] = o.required("drawn", C.is_bool, "true or false", problems)
     out["source"] = o.required("source", C.is_id, "an ID", problems)
-    out["source_channel"] = o.required("source_channel", lambda v: C.is_str(v) and v != "", "a channel name", problems)
-    if first:
-        o.forbidden("turn", "the first blot element is the reference channel")
-        o.forbidden("flip", "the first blot element is the reference channel")
+    out["source_channel"] = o.required("source_channel", lambda v: C.is_str(v) and v != "", "a source channel name",
+                                       problems)
+    if reference:
+        o.forbidden("turn", "it is the reference channel")
+        o.forbidden("flip", "it is the reference channel")
         out["turn"], out["flip"] = 0, False
+    elif reference is None:
+        out["turn"] = o.optional("turn", lambda v: C.is_int(v) and v in TURNS, "0, 90, 180 or 270")
+        out["flip"] = o.optional("flip", C.is_bool, "true or false")
     else:
         out["turn"] = o.required("turn", lambda v: C.is_int(v) and v in TURNS, "0, 90, 180 or 270", problems)
         out["flip"] = o.required("flip", C.is_bool, "true or false", problems)
     out["invert"] = o.required("invert", C.is_bool, "true or false", problems)
     out["contrast"] = o.required("contrast", _contrast_ok, "[minimum, maximum] integers with minimum ≤ maximum", problems)
-    if not marker:
-        if count >= 2:
-            out["color"] = o.required("color", _color_ok, "three numbers from 0 to 1", problems)
-        else:
-            out["color"] = o.optional("color", _color_ok, "three numbers from 0 to 1")
-    if out.get("source_channel") == "average":
-        out["pixel_hash"] = o.optional("pixel_hash", C.is_hash, "a hash")
-        if out["pixel_hash"] is not None and ctx.hash_error(f"{where}.pixel_hash", out["pixel_hash"]):
-            ctx.broken("key.invalid", "'pixel_hash' uses a hash kind this version does not define and was ignored.",
-                       f"{where}.pixel_hash")
-            out["pixel_hash"] = None
+    if out["drawn"] is True and drawn_count >= 2:
+        out["color"] = o.required("color", _color_ok, "three numbers from 0 to 1", problems)
     else:
-        o.forbidden("pixel_hash", "only an 'average' element records a pixel hash")
+        out["color"] = o.optional("color", _color_ok, "three numbers from 0 to 1")
     o.finish()
     return (None, problems) if problems else (out, [])
+
+
+def _read_channels(ctx: Context, core: Obj, view: CoreView) -> tuple[list[tuple[int, dict]], set[str]]:
+    """`channels`, `reference_channel` and `blend` (§5.6, §5.7)."""
+
+    channels_raw = core.raw("channels")
+    reference_raw = core.raw("reference_channel")
+    if type(channels_raw) is not list or not channels_raw:
+        view.unreadable.add("channels")
+        channels_raw = []
+    written_ids = [item.get("id") for item in channels_raw if type(item) is dict]
+    # Which element is the reference channel is known only from an ID
+    # written once among the elements; otherwise it cannot be read (rule 4).
+    reference_id = reference_raw if C.is_id(reference_raw) and written_ids.count(reference_raw) == 1 else None
+    if reference_id is None:
+        view.unreadable.add("reference_channel")
+    drawn = sum(1 for item in channels_raw if type(item) is dict and item.get("drawn") is True)
+    view.drawn_count_as_written = drawn
+    items = []
+    for i, item in enumerate(channels_raw):
+        reference = None if reference_id is None else (type(item) is dict and item.get("id") == reference_id)
+        element, why = _read_panel_channel(ctx, item, f"core.channels[{i}]", reference, drawn)
+        if element is None:
+            _broken(ctx, "panel channel", f"core.channels[{i}]", why)
+            if reference:
+                view.unreadable.add("reference_channel")
+        else:
+            items.append((i, element))
+    items, ambiguous = _dedupe_ids(ctx, items, "panel channel", "core.channels", channels_raw)
+    if channels_raw and not drawn:
+        ctx.broken("channels.none_drawn", "No panel channel is drawn ('drawn' is true in none of them); the rendered "
+                   "image cannot be drawn again.", "core.channels")
+    if "channels" not in view.unreadable:
+        view.channels = [e for _, e in items]
+        if not view.channels:
+            view.channels = None
+            view.unreadable.add("channels")
+    if "reference_channel" not in view.unreadable:
+        view.reference_channel = reference_id
+
+    blend = core.optional("blend", C.is_str, "a string")
+    if blend in BLENDS:
+        view.blend = blend
+    elif blend is not None:
+        if ctx.unknown_value("core.blend", blend):
+            view.blend_unknown = True
+        else:
+            ctx.broken("key.invalid", f"'blend' has the value {blend!r} and was ignored.", "core.blend")
+    return items, ambiguous
 
 
 # --- samples, rows, bands, markers ---------------------------------------------------
@@ -437,19 +554,13 @@ def _read_lane(ctx: Context, value, where: str, banded: set, condition_ids: set,
     return out, []
 
 
-def _read_row(ctx: Context, value, where: str, blot_count: int | None):
+def _read_row(ctx: Context, value, where: str):
     if type(value) is not dict:
         return None, ["not an object"]
     o = Obj(ctx, value, where)
     problems: list[str] = []
-    out = {"id": o.required("id", C.is_id, "an ID", problems), "name": o.optional("name", C.is_str, "a string")}
-    if blot_count is None:
-        out["channel"] = o.raw("channel") if C.is_id(value.get("channel")) else None
-    elif blot_count >= 2:
-        out["channel"] = o.required("channel", C.is_id, "an ID", problems)
-    else:
-        o.forbidden("channel", "the blot has one element")
-        out["channel"] = None
+    out = {"id": o.required("id", C.is_id, "an ID", problems), "name": o.optional("name", C.is_str, "a string"),
+           "channel": o.required("channel", C.is_id, "an ID", problems)}
     o.finish()
     return (None, problems) if problems else (out, [])
 
@@ -499,25 +610,6 @@ def _read_marker_label(ctx: Context, value, where: str):
            "x": o.required("x", C.is_number, "a number", problems),
            "y": o.required("y", C.is_number, "a number", problems),
            "label": o.required("label", C.is_str, "a string", problems)}
-    size = o.optional("size", lambda v: type(v) is dict, "an object")
-    if size is not None:
-        s = Obj(ctx, size, f"{where}.size")
-        why: list[str] = []
-        number = s.required("value", lambda v: C.is_number(v) and v > 0, "a number above 0", why)
-        unit = s.raw("unit")
-        newer_unit = False
-        if unit not in SIZE_UNITS:
-            if not C.is_str(unit):
-                why.append("'unit' is missing or not a string")
-            elif ctx.unknown_value(f"{where}.size.unit", unit):
-                newer_unit = True  # the size is not used (rule 2)
-            else:
-                why.append(f"'unit' {unit!r} is not defined")
-        s.finish()
-        if why:
-            ctx.broken("key.invalid", "'size' was ignored: " + "; ".join(why) + ".", f"{where}.size")
-        elif not newer_unit:
-            out["size"] = {"value": number, "unit": unit}
     o.finish()
     return (None, problems) if problems else (out, [])
 
@@ -537,7 +629,7 @@ def read_core(ctx: Context, raw: dict) -> CoreView:
     else:
         for item in sources_raw:
             if type(item) is dict:
-                channels = item.get("channels") if type(item.get("channels")) is list else []
+                channels = item.get("source_channels") if type(item.get("source_channels")) is list else []
                 pointers = [c.get("pixel_hash") for c in channels if type(c) is dict]
                 view.pointed_to_written.update(p for p in [*pointers, item.get("source_metadata")] if C.is_hash(p))
         items = []
@@ -547,7 +639,7 @@ def read_core(ctx: Context, raw: dict) -> CoreView:
                 _broken(ctx, "source image", f"core.sources[{i}]", why)
             else:
                 items.append((i, source))
-        items, ambiguous_sources = _dedupe_ids(ctx, items, "source image", "core.sources")
+        items, ambiguous_sources = _dedupe_ids(ctx, items, "source image", "core.sources", sources_raw)
         view.sources = [s for _, s in items]
         if not view.sources:
             view.unreadable.add("sources")
@@ -558,33 +650,7 @@ def read_core(ctx: Context, raw: dict) -> CoreView:
 
     _read_embedded(ctx, core, view)
 
-    # blot
-    blot_raw = core.raw("blot")
-    ambiguous_blot: set[str] = set()
-    if type(blot_raw) is not list or not blot_raw:
-        view.unreadable.add("blot")
-    else:
-        view.blot_count_as_written = len(blot_raw)
-        items = []
-        for i, item in enumerate(blot_raw):
-            element, why = _read_view_element(ctx, item, f"core.blot[{i}]", i == 0, len(blot_raw), marker=False)
-            if element is None:
-                _broken(ctx, "blot element", f"core.blot[{i}]", why)
-                if i == 0:
-                    view.unreadable.add("blot")
-            else:
-                items.append((i, element))
-        if "blot" not in view.unreadable:
-            items, ambiguous_blot = _dedupe_ids(ctx, items, "blot element", "core.blot")
-            view.blot = [e for _, e in items]
-
-    marker_raw = core.optional("marker", lambda v: type(v) is dict, "an object")
-    if marker_raw is not None:
-        element, why = _read_view_element(ctx, marker_raw, "core.marker", False, 0, marker=True)
-        if element is None:
-            _broken(ctx, "marker image", "core.marker", why)
-        else:
-            view.marker = element
+    channel_items, ambiguous_channels = _read_channels(ctx, core, view)
 
     # orientation
     orientation_raw = core.raw("orientation")
@@ -641,7 +707,8 @@ def read_core(ctx: Context, raw: dict) -> CoreView:
             _broken(ctx, "condition", f"core.samples.conditions[{i}]", why)
         else:
             cond_items.append((i, cond))
-    cond_items, ambiguous_conditions = _dedupe_ids(ctx, cond_items, "condition", "core.samples.conditions")
+    cond_items, ambiguous_conditions = _dedupe_ids(ctx, cond_items, "condition", "core.samples.conditions",
+                                                   conditions_raw)
     view.conditions = [c for _, c in cond_items]
     condition_ids = {c["id"] for c in view.conditions} - ambiguous_conditions
 
@@ -658,32 +725,32 @@ def read_core(ctx: Context, raw: dict) -> CoreView:
             _broken(ctx, "lane", f"core.samples.lanes[{i}]", why)
         else:
             lane_items.append((i, lane))
-    lane_items, ambiguous_lanes = _dedupe_ids(ctx, lane_items, "lane", "core.samples.lanes")
+    lane_items, ambiguous_lanes = _dedupe_ids(ctx, lane_items, "lane", "core.samples.lanes", lanes_raw)
     view.lanes = [lane for _, lane in lane_items]
 
     rows_raw = core.optional("rows", lambda v: type(v) is list, "an array") or []
-    blot_count = None if "blot" in view.unreadable else view.blot_count_as_written
     row_items = []
     for i, item in enumerate(rows_raw):
-        row, why = _read_row(ctx, item, f"core.rows[{i}]", blot_count)
+        row, why = _read_row(ctx, item, f"core.rows[{i}]")
         if row is None:
             _broken(ctx, "row", f"core.rows[{i}]", why)
         else:
             row_items.append((i, row))
-    row_items, ambiguous_rows = _dedupe_ids(ctx, row_items, "row", "core.rows")
+    row_items, ambiguous_rows = _dedupe_ids(ctx, row_items, "row", "core.rows", rows_raw)
 
     band_items = []
-    cells: set[tuple] = set()
+    # The cells as written: a later band in a cell is dropped even when the earlier one is broken (rule 3).
+    first_in_cell, _ = _firsts([
+        (item.get("lane"), item.get("row")) if type(item) is dict and C.is_id(item.get("lane"))
+        and C.is_id(item.get("row")) else None for item in bands_raw])
     for i, item in enumerate(bands_raw):
         band, why = _read_band(ctx, item, f"core.bands[{i}]")
         if band is None:
             _broken(ctx, "band", f"core.bands[{i}]", why)
             continue
-        cell = (band["lane"], band["row"])
-        if cell in cells:
+        if first_in_cell.get((band["lane"], band["row"]), i) != i:
             ctx.broken("band.cell", "A later band in the same cell (lane and row) was dropped.", f"core.bands[{i}]")
             continue
-        cells.add(cell)
         band_items.append((i, band))
 
     markers_raw = core.optional("markers", lambda v: type(v) is list, "an array") or []
@@ -694,29 +761,33 @@ def read_core(ctx: Context, raw: dict) -> CoreView:
             _broken(ctx, "marker label", f"core.markers[{i}]", why)
         else:
             marker_items.append((i, label))
-    marker_items, _ = _dedupe_ids(ctx, marker_items, "marker label", "core.markers")
+    marker_items, _ = _dedupe_ids(ctx, marker_items, "marker label", "core.markers", markers_raw)
     view.markers = [m for _, m in marker_items]
+    view.marker_unit = core.optional("marker_unit", C.is_str, "a string")
 
-    view.annotation = core.optional("annotation", C.is_str, "a string")
+    view.annotations = _read_annotations(ctx, core)
     view.note = core.optional("note", C.is_str, "a string")
     core.finish()
 
     # references: drop what points to something dropped, until nothing changes
-    _resolve(ctx, view, ambiguous_sources, ambiguous_blot, ambiguous_lanes, ambiguous_rows,
-             row_items, band_items)
+    _resolve(ctx, view, ambiguous_sources, ambiguous_channels, ambiguous_lanes, ambiguous_rows,
+             channel_items, row_items, band_items)
 
-    # output_bit_depth needs a readable blot and its sources
-    if view.output_bit_depth == 16 and view.blot and view.sources is not None:
-        dtypes = []
-        for element in view.blot:
-            source = view.source(element["source"])
-            dtypes.append(source.get("dtype") if source else None)
-        if dtypes and all(d == "uint8" for d in dtypes):
+    # output_bit_depth (§5.10), while the panel channels and sources can be
+    # read (rule 4): judged on them as written, before anything was dropped (rule 3)
+    if view.output_bit_depth == 16 and view.channels is not None and view.sources is not None:
+        dtypes_of: dict[str, set] = {}
+        for item in raw.get("sources") or ():
+            if type(item) is dict and C.is_id(item.get("id")):
+                dtypes_of.setdefault(item["id"], set()).add(item.get("dtype"))
+        dtypes = [dtypes_of.get(item.get("source"), {None}) for item in raw.get("channels") or ()
+                  if type(item) is dict and item.get("drawn") is True]
+        if dtypes and all(d == {"uint8"} for d in dtypes):
             view.output_bit_depth = None
             view.unreadable.add("output_bit_depth")
-            ctx.broken("core.output_bit_depth", "'output_bit_depth' is 16 although every blot source is uint8.",
-                       "core.output_bit_depth")
-    for key in ("blot", "orientation"):
+            ctx.broken("core.output_bit_depth", "'output_bit_depth' is 16 although the source image of every drawn "
+                       "panel channel is uint8.", "core.output_bit_depth")
+    for key in ("channels", "reference_channel", "orientation"):
         if key in view.unreadable:
             ctx.note(C.Kind.UNREADABLE, "core.unreadable", f"The core key {key!r} cannot be read (rule 4).", f"core.{key}")
     if "output_bit_depth" in view.unreadable:
@@ -725,7 +796,8 @@ def read_core(ctx: Context, raw: dict) -> CoreView:
     return view
 
 
-def _resolve(ctx, view, ambiguous_sources, ambiguous_blot, ambiguous_lanes, ambiguous_rows, row_items, band_items):
+def _resolve(ctx, view, ambiguous_sources, ambiguous_channels, ambiguous_lanes, ambiguous_rows,
+             channel_items, row_items, band_items):
     sources_readable = view.sources is not None
     rows = list(row_items)
     bands = list(band_items)
@@ -742,40 +814,43 @@ def _resolve(ctx, view, ambiguous_sources, ambiguous_blot, ambiguous_lanes, ambi
             return False
         name = element["source_channel"]
         if name in source.get("ambiguous_channels", ()):
-            ctx.broken("reference.ambiguous", f"It chooses the channel name {name!r}, used twice; it was dropped.", where)
+            ctx.broken("reference.ambiguous", f"It chooses the source channel name {name!r}, used twice; it was dropped.",
+                       where)
             return False
-        names = {c["name"] for c in source["channels"]}
+        names = {c["name"] for c in source["source_channels"]}
         if name == "average":
             if not _is_rgb(source):
                 ctx.broken("reference.average", "'average' can only be chosen in an RGB source image; it was dropped.", where)
                 return False
         elif name not in names:
-            ctx.broken("reference.missing", f"Its channel {name!r} does not exist in the source image; it was dropped.", where)
+            ctx.broken("reference.missing", f"Its source channel {name!r} does not exist in the source image; "
+                       "it was dropped.", where)
             return False
         return True
 
-    if view.blot is not None:
+    if view.channels is not None:
         kept = []
-        for i, element in enumerate(view.blot):
-            if source_ok(element, f"core.blot[{i}]"):
+        for i, element in channel_items:
+            if source_ok(element, f"core.channels[{i}]"):
                 kept.append(element)
-            elif i == 0:
-                view.blot = None
-                view.unreadable.add("blot")
-                break
-        else:
-            view.blot = kept
-    if view.marker is not None and not source_ok(view.marker, "core.marker"):
-        view.marker = None
+            elif element["id"] == view.reference_channel:
+                view.reference_channel = None
+                view.unreadable.add("reference_channel")
+        view.channels = kept or None
+        if not kept:
+            view.unreadable.add("channels")
 
-    blot_ids = None if view.blot is None else ({e["id"] for e in view.blot} - ambiguous_blot)
+    channel_ids = None if view.channels is None else (view.channel_ids() - ambiguous_channels)
     kept_rows = []
     for i, row in rows:
-        if blot_ids is not None and row["channel"] is not None:
-            if row["channel"] in ambiguous_blot or row["channel"] not in blot_ids:
-                ctx.broken("reference.missing", f"Its channel {row['channel']!r} is not a blot element that can be used; "
-                           "it was dropped.", f"core.rows[{i}]")
+        if channel_ids is not None:
+            if row["channel"] not in channel_ids:
+                ctx.broken("reference.missing", f"Its panel channel {row['channel']!r} cannot be used; it was dropped.",
+                           f"core.rows[{i}]")
                 continue
+            if view.channel(row["channel"])["role"] == "marker":
+                ctx.broken("reference.marker", f"It points to the marker channel {row['channel']!r}, which a row may "
+                           "not do (§5.6); it was read as written.", f"core.rows[{i}]")
         kept_rows.append(row)
     view.rows = kept_rows
 
@@ -791,4 +866,4 @@ def _resolve(ctx, view, ambiguous_sources, ambiguous_blot, ambiguous_lanes, ambi
             continue
         kept_bands.append(band)
     view.bands = kept_bands
-    view.ambiguous = {"lanes": ambiguous_lanes, "rows": ambiguous_rows, "blot": ambiguous_blot}
+    view.ambiguous = {"lanes": ambiguous_lanes, "rows": ambiguous_rows, "channels": ambiguous_channels}

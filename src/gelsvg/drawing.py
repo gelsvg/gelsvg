@@ -1,6 +1,9 @@
 """Drawing the rendered image (§6.2) and aligned images (§4.2) from a
-panel's core and its channel images, with the reference interpolation, so
-every implementation gets the same pixel values."""
+panel's core and its source channel images, with the reference
+interpolation, so every implementation gets the same pixel values.
+
+A panel channel is named by its ID, or by its place in `channels`; None
+names the reference channel (§5.7)."""
 
 from __future__ import annotations
 
@@ -14,23 +17,41 @@ from ._check import Context
 from ._core import CoreView, read_core
 from .notices import Kind
 
-_NEEDED = ("core.sources", "core.blot", "core.orientation", "core.output_bit_depth")
+_NEEDED = ("core.sources", "core.channels", "core.reference_channel", "core.blend", "core.orientation",
+           "core.output_bit_depth")
+# Told, but no reason not to place a point or make an aligned image (render refuses it itself).
+_HARMLESS = ("channels.none_drawn",)
 
 
-def _view(core: dict, marker: bool = False) -> CoreView:
+def _view(core: dict) -> CoreView:
     """The core read strictly, refusing one whose drawing parts are not all
     there and valid."""
 
     ctx = Context(panel=None, newer_revision=False)
     view = read_core(ctx, copy.deepcopy(core))
-    needed = _NEEDED + (("core.marker",) if marker else ())
     bad = [n.message for n in ctx.notices
-           if n.kind is not Kind.REINTERPRETED and (n.where or "").startswith(needed)]
-    if bad or view.blot is None or view.orientation is None or view.sources is None:
+           if n.kind is not Kind.REINTERPRETED and n.code not in _HARMLESS and (n.where or "").startswith(_NEEDED)]
+    if bad or view.reference() is None or view.orientation is None or view.sources is None:
         raise ValueError("The core cannot be drawn: " + ("; ".join(bad) or "a key it needs is missing") + ".")
-    if marker and view.marker is None:
-        raise ValueError("The core has no marker image.")
     return view
+
+
+def _element(view: CoreView, element: int | str | None) -> dict:
+    if element is None:
+        return view.reference()
+    if isinstance(element, int):
+        return view.channels[element]
+    item = view.channel(element)
+    if item is None:
+        raise ValueError(f"The core has no panel channel {element!r}.")
+    return item
+
+
+def _turned(view: CoreView, item: dict) -> dict | None:
+    """The panel channel as `_render.aligned` takes it: None for the
+    reference channel, which is not turned to itself (§4.2)."""
+
+    return None if item["id"] == view.reference_channel else item
 
 
 def _channel(view: CoreView, element: dict, pixels: Mapping[str, np.ndarray]) -> np.ndarray:
@@ -40,13 +61,14 @@ def _channel(view: CoreView, element: dict, pixels: Mapping[str, np.ndarray]) ->
     dtype = np.uint8 if source["dtype"] == "uint8" else np.uint16
 
     def one(name: str) -> np.ndarray:
-        channel = next(c for c in source["channels"] if c["name"] == name)
+        channel = next(c for c in source["source_channels"] if c["name"] == name)
         key = channel.get("pixel_hash") if channel.get("pixel_hash_known") else None
         image = pixels.get(key) if key is not None else None
         if image is None:
-            raise ValueError(f"The channel image of {source['id']!r} / {name!r} is not given.")
+            raise ValueError(f"The source channel image of {source['id']!r} / {name!r} is not given.")
         if image.dtype != dtype or list(image.shape) != source["shape"] or _hashes.pixel_hash(image) != key:
-            raise ValueError(f"The channel image given for {source['id']!r} / {name!r} does not match its pixel hash.")
+            raise ValueError(f"The source channel image given for {source['id']!r} / {name!r} does not match its "
+                             "pixel hash.")
         return image
 
     if element["source_channel"] == "average":
@@ -55,7 +77,7 @@ def _channel(view: CoreView, element: dict, pixels: Mapping[str, np.ndarray]) ->
 
 
 def _reference_shape(view: CoreView) -> list[int]:
-    shape = view.source(view.blot[0]["source"]).get("shape")
+    shape = view.source(view.reference()["source"]).get("shape")
     if shape is None:
         raise ValueError("The core cannot be drawn: the reference channel's source image has no 'shape'.")
     return shape
@@ -94,20 +116,16 @@ def _window(view: CoreView, crop: dict | None) -> tuple[int, int, int, int] | No
     return y, y + h, x, x + w
 
 
-def aligned_image(core: dict, pixels: Mapping[str, np.ndarray], element: int | str = 0,
+def aligned_image(core: dict, pixels: Mapping[str, np.ndarray], element: int | str | None = None,
                   crop: dict | None = None) -> np.ndarray:
-    """The aligned image (§4.2) of the blot element at `element`, or of the
-    marker image (`element="marker"`), before `invert`; only the `crop`
-    rectangle of it when given. `pixels` maps pixel hashes to channel
-    images (as `Panel.channel_images` does)."""
+    """The aligned image (§4.2) of a panel channel, before `invert`; only
+    the `crop` rectangle of it when given. `pixels` maps pixel hashes to
+    source channel images (as `Panel.source_channel_images` does)."""
 
-    marker = element == "marker"
-    view = _view(core, marker=marker)
-    item = view.marker if marker else view.blot[element]
-    channel = _channel(view, item, pixels)
-    first = not marker and element == 0
-    return _render.aligned(channel, _reference_shape(view), None if first else item, view.orientation,
-                           _window(view, crop))
+    view = _view(core)
+    item = _element(view, element)
+    return _render.aligned(_channel(view, item, pixels), _reference_shape(view), _turned(view, item),
+                           view.orientation, _window(view, crop))
 
 
 def render(core: dict, pixels: Mapping[str, np.ndarray], crop: dict | None = None) -> np.ndarray:
@@ -118,30 +136,33 @@ def render(core: dict, pixels: Mapping[str, np.ndarray], crop: dict | None = Non
     view = _view(core)
     if view.output_bit_depth is None:
         raise ValueError("The core cannot be drawn: 'output_bit_depth' cannot be read.")
+    if view.blend_unknown:
+        raise ValueError("The core cannot be drawn: 'blend' is of a newer revision of the format.")
+    drawn = view.drawn()
+    if not drawn:
+        raise ValueError("The core cannot be drawn: no panel channel is drawn.")
     window = _window(view, crop if crop is not None else default_crop(core))
     reference = _reference_shape(view)
     levels, colors, high_bit = [], [], False
-    for i, element in enumerate(view.blot):
-        image = _render.aligned(_channel(view, element, pixels), reference, None if i == 0 else element,
+    for element in drawn:
+        image = _render.aligned(_channel(view, element, pixels), reference, _turned(view, element),
                                 view.orientation, window)
         if element["invert"]:
             image = np.iinfo(image.dtype).max - image
         levels.append(_render.level(image, element["contrast"]))
         colors.append(element.get("color"))
         high_bit = high_bit or image.dtype == np.uint16
-    grey = len(view.blot) == 1 and colors[0] is None
+    grey = len(drawn) == 1 and colors[0] is None
     return _render.compose(levels, None if grey else colors, high_bit, view.output_bit_depth)
 
 
 # --- points -------------------------------------------------------------------------------------
 
 
-def _stages(view: CoreView, element: int | str) -> list[tuple]:
-    """The transforms from the element's channel image to the aligned
-    image (§4.2), each with the size of the image it starts from."""
+def _stages(view: CoreView, item: dict) -> list[tuple]:
+    """The transforms from the panel channel's source channel image to the
+    aligned image (§4.2), each with the size of the image it starts from."""
 
-    marker = element == "marker"
-    item = view.marker if marker else view.blot[element]
     height, width = view.source(item["source"])["shape"]
     stages = []
 
@@ -154,7 +175,7 @@ def _stages(view: CoreView, element: int | str) -> list[tuple]:
     def flip():
         stages.append(("flip", width))
 
-    if marker or element != 0:
+    if item["id"] != view.reference_channel:
         if item["turn"]:
             turn(item["turn"])
         if item["flip"]:
@@ -201,22 +222,21 @@ def _backward(stage: tuple, x: float, y: float) -> tuple[float, float]:
             (((-s) * (x - frame_w / 2)) + (c * (y - frame_h / 2))) + h / 2)
 
 
-def to_channel(core: dict, x: float, y: float, element: int | str = 0) -> tuple[float, float]:
-    """Where the panel's point (x, y) lies on the channel image of the blot
-    element at `element`, or of the marker image (`"marker"`): §4.2
-    followed backwards (§4.3). Points are not rounded."""
+def to_channel(core: dict, x: float, y: float, element: int | str | None = None) -> tuple[float, float]:
+    """Where the panel's point (x, y) lies on the source channel image of a
+    panel channel: §4.2 followed backwards (§4.3). Points are not rounded."""
 
-    view = _view(core, marker=element == "marker")
-    for stage in reversed(_stages(view, element)):
+    view = _view(core)
+    for stage in reversed(_stages(view, _element(view, element))):
         x, y = _backward(stage, x, y)
     return x, y
 
 
-def to_panel(core: dict, x: float, y: float, element: int | str = 0) -> tuple[float, float]:
-    """Where a point of the element's channel image lies in the panel's
-    coordinates (§4.2, §4.3)."""
+def to_panel(core: dict, x: float, y: float, element: int | str | None = None) -> tuple[float, float]:
+    """Where a point of a panel channel's source channel image lies in the
+    panel's coordinates (§4.2, §4.3)."""
 
-    view = _view(core, marker=element == "marker")
-    for stage in _stages(view, element):
+    view = _view(core)
+    for stage in _stages(view, _element(view, element)):
         x, y = _forward(stage, x, y)
     return x, y

@@ -19,7 +19,7 @@ def source_pixels() -> np.ndarray:
 
 
 def base_panel():
-    """(panel JSON, channel image PNG, rendered pixels)."""
+    """(panel JSON, source channel image PNG, rendered pixels)."""
 
     pixels = source_pixels()
     channel_png = B.image_png(pixels)
@@ -27,13 +27,15 @@ def base_panel():
     core = {
         "sources": [{
             "id": "s1", "file_name": "blot.tif", "file_hash": "sha256:" + "ab" * 32,
-            "dtype": "uint8", "shape": [6, 8], "channels": [{"name": "gray", "pixel_hash": pixel}],
+            "dtype": "uint8", "shape": [6, 8], "source_channels": [{"name": "gray", "pixel_hash": pixel}],
         }],
-        "embedded": {"channel_images": {pixel: {
+        "embedded": {"source_channel_images": {pixel: {
             "kind": "decoded_scalar_plane", "media_type": "image/png", "dtype": "uint8", "shape": [6, 8],
             "byte_length": len(channel_png), "png_hash": "sha256:" + hashlib.sha256(channel_png).hexdigest(),
         }}},
-        "blot": [{"id": "c1", "source": "s1", "source_channel": "gray", "invert": False, "contrast": [0, 255]}],
+        "channels": [{"id": "c1", "drawn": True, "source": "s1", "source_channel": "gray", "invert": False,
+                      "contrast": [0, 255]}],
+        "reference_channel": "c1",
         "orientation": {"turn": 0, "flip": False, "rotation": 0},
         "output_bit_depth": 8,
         "samples": {
@@ -43,12 +45,12 @@ def base_panel():
                 {"id": "n1"},
             ],
         },
-        "rows": [{"id": "r1", "name": "p-ERK"}],
+        "rows": [{"id": "r1", "name": "p-ERK", "channel": "c1"}],
         "bands": [
             {"lane": "1", "row": "r1", "shape": "rect", "x": 1, "y": 2, "w": 2, "h": 1},
             {"lane": "n1", "row": "r1", "shape": "point", "x": 6, "y": 2.5},
         ],
-        "markers": [{"id": "m1", "x": 0.5, "y": 3, "label": "50", "size": {"value": 50, "unit": "kDa"}}],
+        "markers": [{"id": "m1", "x": 0.5, "y": 3, "label": "50 kDa"}],
     }
     rendered = pixels.copy()
     panel = {
@@ -57,7 +59,7 @@ def base_panel():
         "written_by": {"name": "test", "version": "1"},
         "core": core,
         "quantifications": [{
-            "mode": "lane", "pixels": "aligned", "method": {"name": "sum", "by": "test 1"},
+            "mode": "lane", "pixels": "aligned", "channel": "c1", "method": {"name": "sum", "by": "test 1"},
             "inverted": False, "computed_on": _hashes.quant_core_hash(core),
             "values": [{"lane": "1", "region": {"shape": "rect", "x": 0, "y": 0, "w": 4, "h": 6}, "raw": 100, "signal": 90}],
         }],

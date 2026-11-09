@@ -1,5 +1,5 @@
 """Reading a source file into a source image (§5.2, §5.4, §5.5): its
-channel images, named as §5.2 says, and its metadata in the formal format.
+source channel images, named as §5.2 says, and its metadata in the formal format.
 PNG, JPEG, TIFF and Bio-Rad Image Lab `.scn` files are read."""
 
 from __future__ import annotations
@@ -39,16 +39,16 @@ class SourceImage:
         return list(self.pixels.shape[:2])
 
     @property
-    def channels(self) -> dict[str, np.ndarray]:
-        """The channel images by name, in file order (§5.2)."""
+    def source_channels(self) -> dict[str, np.ndarray]:
+        """The source channel images by name, in file order (§5.2)."""
 
         if self.pixels.ndim == 2:
             return {"gray": self.pixels}
         return {name: np.ascontiguousarray(self.pixels[..., i]) for i, name in enumerate(("red", "green", "blue"))}
 
     @property
-    def channel_images(self) -> list[np.ndarray]:
-        return list(self.channels.values())
+    def source_channel_images(self) -> list[np.ndarray]:
+        return list(self.source_channels.values())
 
     @property
     def source_metadata(self) -> list[tuple[dict, bytes]]:
@@ -62,7 +62,8 @@ class SourceImage:
             out["file_name"] = self.file_name
         out["file_hash"] = self.file_hash
         out["dtype"], out["shape"] = self.dtype, self.shape
-        out["channels"] = [{"name": name, "pixel_hash": _hashes.pixel_hash(image)} for name, image in self.channels.items()]
+        out["source_channels"] = [{"name": name, "pixel_hash": _hashes.pixel_hash(image)}
+                                  for name, image in self.source_channels.items()]
         if self.metadata is not None:
             out["source_metadata"] = _formal.key(self.metadata[0])
         return out

@@ -53,7 +53,7 @@ def _missing_body(ctx: Context, carrier: Carrier, unknown_chunks: bool, what: st
 
 
 def decode_channel_png(payload: bytes):
-    """The pixels of a channel image PNG, or the reason it cannot be one
+    """The pixels of a source channel image PNG, or the reason it cannot be one
     (§5.3)."""
 
     walk = _png.walk(payload)
@@ -87,8 +87,8 @@ def decode_channel_png(payload: bytes):
 
 def check_embedded(ctx: Context, view: CoreView, carrier: Carrier, decoded: dict | None = None) -> dict:
     """Verify every catalog entry against its payload. Returns the decoded
-    channel images by pixel hash (only those that passed). `decoded` holds
-    channel image PNGs already decoded, by the SHA-256 (hex) of their bytes:
+    source channel images by pixel hash (only those that passed). `decoded` holds
+    source channel image PNGs already decoded, by the SHA-256 (hex) of their bytes:
     the writer reading back what it wrote, which need not decode them again."""
 
     unknown_chunks = _report_chunks(ctx, carrier)
@@ -97,17 +97,17 @@ def check_embedded(ctx: Context, view: CoreView, carrier: Carrier, decoded: dict
 
     users: dict[str, list[dict]] = {}
     for source in view.sources or ():
-        for channel in source["channels"]:
+        for channel in source["source_channels"]:
             if channel.get("pixel_hash_known"):
                 users.setdefault(channel["pixel_hash"], []).append(source)
 
     images: dict[str, np.ndarray] = {}
-    for key, entry in list(view.channel_images.items()):
-        where = f"core.embedded.channel_images[{key!r}]"
+    for key, entry in list(view.source_channel_images.items()):
+        where = f"core.embedded.source_channel_images[{key!r}]"
         if key not in users:
             if key not in view.pointed_to_written:
-                ctx.broken("embedded.unreferenced", "A channel image no channel points to was ignored.", where)
-            del view.channel_images[key]
+                ctx.broken("embedded.unreferenced", "A source channel image no source channel points to was ignored.", where)
+            del view.source_channel_images[key]
             continue
         problems = []
         head, body = C.hash_parts(entry["png_hash"])
@@ -116,11 +116,11 @@ def check_embedded(ctx: Context, view: CoreView, carrier: Carrier, decoded: dict
             if not ctx.unknown_value(f"{where}.png_hash", entry["png_hash"]):
                 problems.append("'png_hash' uses a hash kind this version does not define")
             else:
-                del view.channel_images[key]
+                del view.source_channel_images[key]
                 continue
         elif payload is None:
-            _missing_body(ctx, carrier, unknown_chunks, "channel image", where)
-            del view.channel_images[key]
+            _missing_body(ctx, carrier, unknown_chunks, "source channel image", where)
+            del view.source_channel_images[key]
             continue
         if not problems:
             if len(payload.payload) != entry["byte_length"]:
@@ -128,7 +128,7 @@ def check_embedded(ctx: Context, view: CoreView, carrier: Carrier, decoded: dict
         if not problems:
             pixels, why = (decoded[body], None) if decoded and body in decoded else decode_channel_png(payload.payload)
             if pixels is None:
-                problems.append(f"its PNG is not a valid channel image ({why})")
+                problems.append(f"its PNG is not a valid source channel image ({why})")
             else:
                 dtype = "uint8" if pixels.dtype == np.uint8 else "uint16"
                 if dtype != entry["dtype"] or list(pixels.shape) != entry["shape"]:
@@ -141,9 +141,9 @@ def check_embedded(ctx: Context, view: CoreView, carrier: Carrier, decoded: dict
                     images[key] = pixels
                     entry["payload"] = payload.payload
         if problems:
-            ctx.broken("element.broken", "The channel image was dropped: " + "; ".join(problems)
-                       + ". Its channel is read as not embedded.", where)
-            del view.channel_images[key]
+            ctx.broken("element.broken", "The source channel image was dropped: " + "; ".join(problems)
+                       + ". Its source channel is read as not embedded.", where)
+            del view.source_channel_images[key]
 
     metadata_users = {s["source_metadata"] for s in view.sources or () if s.get("source_metadata")}
     for key, entry in list(view.source_metadata.items()):
@@ -189,7 +189,7 @@ def check_embedded(ctx: Context, view: CoreView, carrier: Carrier, decoded: dict
                        "it is read as having no metadata.", f"core.sources[{source['id']!r}].source_metadata")
     for body, g in codec1.items():
         if "sha256:" + body not in view.payloads_written[1]:
-            ctx.broken("embedded.unused", "A channel image payload no entry uses was ignored.", f"geLs at byte {g.chunk.offset}")
+            ctx.broken("embedded.unused", "A source channel image payload no entry uses was ignored.", f"geLs at byte {g.chunk.offset}")
     for body, g in codec2.items():
         if "sha256:" + body not in view.payloads_written[2]:
             ctx.broken("embedded.unused", "A source metadata payload no entry uses was ignored.", f"geLs at byte {g.chunk.offset}")

@@ -39,6 +39,9 @@ class Element:
     """Position in document order, counting from 0."""
     offset: int = 0
     """Byte offset of the start tag's `<` in the SVG."""
+    end_tag: int = -1
+    """Byte offset of the end tag's `<`; for an empty-element tag, of the
+    byte after it."""
 
     def ancestors(self):
         node = self.parent
@@ -180,7 +183,7 @@ def parse(svg: bytes) -> Tree:
         stack.append(element)
 
     def end(_name):
-        stack.pop()
+        stack.pop().end_tag = parser.CurrentByteIndex
 
     parser.StartElementHandler = start
     parser.EndElementHandler = end

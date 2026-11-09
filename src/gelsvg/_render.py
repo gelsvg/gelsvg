@@ -136,8 +136,8 @@ def average(red: np.ndarray, green: np.ndarray, blue: np.ndarray) -> np.ndarray:
 
 def aligned(channel: np.ndarray, reference_shape, element: dict | None, orientation: dict,
             window: tuple[int, int, int, int] | None = None) -> np.ndarray:
-    """The aligned image of one blot element or the marker image (§4.2).
-    `element` is None for the reference channel."""
+    """The aligned image of one panel channel (§4.2). `element` is None for
+    the reference channel."""
 
     image = channel
     if element is not None:

@@ -16,19 +16,19 @@ RENDERED_PREFIX = b"GelSVG rendered image v1\0"
 # §2.7: what the hash for quantification leaves out, beyond `embedded` and
 # `sources[].source_metadata`.
 _QUANT_TEXT = {
+    ("channels", "name"),
     ("samples", "conditions", "name"),
     ("samples", "lanes", "number"),
     ("samples", "lanes", "details"),
     ("samples", "lanes", "values"),
     ("rows", "name"),
     ("markers", "label"),
-    ("markers", "size"),
-    ("blot", "invert"),
-    ("blot", "contrast"),
-    ("blot", "color"),
+    ("channels", "drawn"),
+    ("channels", "invert"),
+    ("channels", "contrast"),
+    ("channels", "color"),
 }
-_QUANT_TOP = ("annotation", "note", "output_bit_depth")
-_QUANT_MARKER = ("invert", "contrast")
+_QUANT_TOP = ("marker_unit", "annotations", "note", "blend", "output_bit_depth")
 
 
 def sha256(data: bytes) -> str:
@@ -77,10 +77,6 @@ def quant_core_hash(core) -> str:
                     _drop_in_array(samples, path[1], path[2])
         for key in _QUANT_TOP:
             out.pop(key, None)
-        marker = out.get("marker")
-        if isinstance(marker, dict):
-            for key in _QUANT_MARKER:
-                marker.pop(key, None)
     return sha256(_json.canonical(out))
 
 
@@ -91,10 +87,10 @@ def _values_bytes(pixels: np.ndarray) -> bytes:
 
 
 def pixel_hash(pixels: np.ndarray) -> str:
-    """§5.3: one channel image's canonical form."""
+    """§5.3: one source channel image's canonical form."""
 
     if pixels.ndim != 2:
-        raise ValueError("a channel image has one value per pixel")
+        raise ValueError("a source channel image has one value per pixel")
     mark = b"u8\0" if pixels.dtype == np.uint8 else b"u16"
     height, width = pixels.shape
     return sha256(PIXEL_PREFIX + mark + struct.pack(">II", height, width) + _values_bytes(pixels))

@@ -14,6 +14,7 @@ from ._carrier import Carrier
 from ._check import Context, Obj
 from ._core import CoreView, read_core
 from ._quant import read_quantifications
+from ._style import read_style
 from ._svgxml import Element
 from .notices import Kind, Notice
 
@@ -42,10 +43,13 @@ class Panel:
     core: CoreView | None = None
     quantifications: list[dict] = field(default_factory=list)
     figure: dict = field(default_factory=dict)
+    """The figure record as read (§6): `crop`, `rendered_hash`, `drawn_from`,
+    `svg_hash`, `svg_hash_method` and `style` (§6.7), None where absent or
+    not readable."""
     assembly: dict | None = None
     extensions: dict = field(default_factory=dict)
-    channel_images: dict[str, np.ndarray] = field(default_factory=dict)
-    """Decoded channel images that passed every check, by pixel hash."""
+    source_channel_images: dict[str, np.ndarray] = field(default_factory=dict)
+    """Decoded source channel images that passed every check, by pixel hash."""
     rendered: np.ndarray | None = None
     core_hash: str | None = None
     quant_hash: str | None = None
@@ -156,7 +160,7 @@ def read_panel(index: int, element: Element, carrier: Carrier, *, decoded: dict 
 
     view = read_core(ctx, raw["core"])
     panel.core = view
-    panel.channel_images = _embedded.check_embedded(ctx, view, carrier, decoded)
+    panel.source_channel_images = _embedded.check_embedded(ctx, view, carrier, decoded)
     panel.core_hash = _hashes.core_hash(raw["core"])
     panel.quant_hash = _hashes.quant_core_hash(raw["core"])
 
@@ -175,8 +179,31 @@ def read_panel(index: int, element: Element, carrier: Carrier, *, decoded: dict 
     return panel
 
 
+def read_assembly_only(index: int, element: Element, carrier: Carrier) -> Panel:
+    """A panel read only as far as its `assembly` (§1.7), as `read_panel`
+    reads it: absent for a panel it would not read, or not read whole."""
+
+    panel = Panel(index=index, element=element, carrier=carrier)
+    if carrier.unreadable:
+        return panel
+    try:
+        raw = _json.parse(carrier.json_text)
+    except _json.JsonError:
+        return panel
+    version = raw.get("schema_version")
+    if raw.get("format") != FORMAT_URL or not C.is_int(version) or not 1 <= version <= C.KNOWN_VERSION:
+        return panel
+    if type(raw.get("core")) is not dict:
+        return panel
+    revision = raw.get("schema_revision")
+    ctx = Context(panel=index, notices=panel.notices,
+                  newer_revision=not (C.is_int(revision) and 0 <= revision <= C.KNOWN_REVISION))
+    _read_assembly(ctx, panel, Obj(ctx, raw, "panel"))
+    return panel
+
+
 def _read_figure(ctx: Context, panel: Panel, figure) -> None:
-    keys = ("crop", "rendered_hash", "drawn_from", "svg_hash", "svg_hash_method")
+    keys = ("crop", "rendered_hash", "drawn_from", "svg_hash", "svg_hash_method", "style")
     panel.figure = dict.fromkeys(keys)
     if type(figure) is not dict:
         ctx.broken("figure.unreadable", "'figure' is missing or not an object; nothing it records can be checked.", "figure")
@@ -220,12 +247,17 @@ def _read_figure(ctx: Context, panel: Panel, figure) -> None:
         else:
             ctx.broken("figure.svg_hash_method", "'svg_hash_method' is missing or not defined; 'svg_hash' cannot be checked.",
                        "figure.svg_hash_method")
+    elif "svg_hash" not in o.value:
+        # §6.1: a method with no hash to take is a writer's error (rule 3).
+        o.forbidden("svg_hash_method", "there is no 'svg_hash'")
     else:
-        o.seen.add("svg_hash_method")
+        o.seen.add("svg_hash_method")  # the hash could not be read: reported with it
+    style = o.optional("style", lambda v: type(v) is dict, "an object")
     o.finish()
 
     _check(ctx, panel, "drawn_from", panel.figure["drawn_from"], panel.core_hash,
            "the data changed after the figure was drawn")
+    panel.figure["style"] = read_style(ctx, style, panel.core, panel.checks.get("drawn_from") is True)
 
     carrier = panel.carrier
     ihdr = carrier.ihdr
@@ -259,8 +291,8 @@ def _read_figure(ctx: Context, panel: Panel, figure) -> None:
             if crop["x"] < 0 or crop["y"] < 0 or crop["x"] + crop["w"] > width or crop["y"] + crop["h"] > height:
                 panel.figure["crop"] = None
                 ctx.broken("figure.crop", "'crop' runs outside the aligned image; its coordinates are not used.", "figure.crop")
-    if panel.checks.get("drawn_from") and ihdr is not None and view is not None and view.blot is not None:
-        expected_type = 2 if any(e.get("color") for e in view.blot) else 0
+    if panel.checks.get("drawn_from") and ihdr is not None and view is not None and view.channels is not None:
+        expected_type = 2 if any(e.get("color") for e in view.drawn()) else 0
         if view.output_bit_depth is not None and (ihdr.color_type, ihdr.bit_depth) != (expected_type, view.output_bit_depth):
             # As for the size of 'crop': only a picture that fails its hash shows it was changed (§6.2).
             if panel.checks.get("rendered_hash") is False:
@@ -273,9 +305,9 @@ def _read_figure(ctx: Context, panel: Panel, figure) -> None:
 
 
 def _aligned_size(view: CoreView):
-    if not view.blot or view.orientation is None or view.sources is None:
+    if view.reference() is None or view.orientation is None or view.sources is None:
         return None
-    source = view.source(view.blot[0]["source"])
+    source = view.source(view.reference()["source"])
     if source is None or source.get("shape") is None:
         return None
     return _geometry.aligned_size(source["shape"], view.orientation)
@@ -290,6 +322,8 @@ def _read_assembly(ctx: Context, panel: Panel, top: Obj) -> None:
     ident = o.required("id", C.is_id, "an ID", why)
     member = o.required("member", C.is_int, "an integer", why)
     members = o.required("members", lambda v: C.is_int(v) and v >= 1, "an integer of 1 or more", why)
+    name = o.optional("name", C.is_str, "a string")
+    omitted = _omitted(ctx, o.optional("omitted", lambda v: type(v) is list, "an array"))
     o.finish()
     if not why and not (1 <= member <= members):
         why.append("'member' is outside 1 to 'members'")
@@ -297,6 +331,35 @@ def _read_assembly(ctx: Context, panel: Panel, top: Obj) -> None:
         ctx.broken("assembly.broken", "'assembly' was read as absent: " + "; ".join(why) + ".", "assembly")
         return
     panel.assembly = {"id": ident, "member": member, "members": members}
+    if name is not None:
+        panel.assembly["name"] = name
+    if omitted:
+        panel.assembly["omitted"] = omitted
+
+
+OMITTABLE = ("sample_label", "details_list", "marker_label", "marker_unit", "row_name", "annotation")
+"""The parts of a panel a set may leave out of its drawing (§1.7 `omitted`)."""
+
+
+def _omitted(ctx: Context, value: list | None) -> list[str] | None:
+    """`assembly.omitted` as read: values of a newer revision are not used
+    (rule 2); anything else wrong reads the whole list as absent (rule 3)."""
+
+    if value is None:
+        return None
+    where = "assembly.omitted"
+    if not all(C.is_str(v) for v in value) or len(set(value)) != len(value):
+        ctx.broken("key.invalid", "'omitted' is not an array of different strings and was ignored.", where)
+        return None
+    known = []
+    for v in value:
+        if v in OMITTABLE:
+            known.append(v)
+        elif not ctx.unknown_value(where, v):
+            ctx.broken("key.invalid", f"'omitted' holds {v!r}, not one of {', '.join(OMITTABLE)}, and was ignored.",
+                       where)
+            return None
+    return known
 
 
 def _read_extensions(ctx: Context, panel: Panel, top: Obj) -> None:

@@ -183,13 +183,25 @@ def number(x: int | float) -> str:
     return sign + digits[0] + "." + digits[1:] + "e" + exp_text
 
 
-def _serialize(value, out: list[str], sort: bool = True) -> None:
+def _float(x: float) -> str:
+    """A float written so that it reads back as a float: a whole number
+    keeps a fraction (`2.0`, not `2`), and so does a negative zero."""
+
+    text = number(x)
+    if x == 0 and math.copysign(1, x) < 0:
+        return "-0.0"
+    return text if any(c in text for c in ".e") else text + ".0"
+
+
+def _serialize(value, out: list[str], sort: bool = True, floats: bool = False) -> None:
     if value is None:
         out.append("null")
     elif value is True:
         out.append("true")
     elif value is False:
         out.append("false")
+    elif floats and isinstance(value, float):
+        out.append(_float(value))
     elif isinstance(value, (int, float)):
         out.append(number(value))
     elif isinstance(value, str):
@@ -199,7 +211,7 @@ def _serialize(value, out: list[str], sort: bool = True) -> None:
         for i, item in enumerate(value):
             if i:
                 out.append(",")
-            _serialize(item, out, sort)
+            _serialize(item, out, sort, floats)
         out.append("]")
     elif isinstance(value, dict):
         out.append("{")
@@ -209,7 +221,7 @@ def _serialize(value, out: list[str], sort: bool = True) -> None:
                 out.append(",")
             out.append(_string(key))
             out.append(":")
-            _serialize(value[key], out, sort)
+            _serialize(value[key], out, sort, floats)
         out.append("}")
     else:
         raise TypeError(f"{type(value).__name__} has no JSON form")
@@ -223,10 +235,23 @@ def canonical(value) -> bytes:
     return "".join(out).encode("utf-8")
 
 
-def dumps(value) -> bytes:
+def dumps(value, keep_floats: tuple[str, ...] = ()) -> bytes:
     """A JSON value as UTF-8 bytes, written like the canonical form but with
-    the keys in their order in each object."""
+    the keys in their order in each object. Under the top-level keys in
+    `keep_floats` (content the format does not define, whose owner may tell
+    an integer from a number by how it is written, §2.2), a float keeps a
+    fraction."""
 
-    out: list[str] = []
-    _serialize(value, out, sort=False)
+    if not keep_floats or not isinstance(value, dict):
+        out: list[str] = []
+        _serialize(value, out, sort=False)
+        return "".join(out).encode("utf-8")
+    out = ["{"]
+    for i, key in enumerate(value):
+        if i:
+            out.append(",")
+        out.append(_string(key))
+        out.append(":")
+        _serialize(value[key], out, sort=False, floats=key in keep_floats)
+    out.append("}")
     return "".join(out).encode("utf-8")

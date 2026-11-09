@@ -30,7 +30,7 @@ from ._core import CHANNEL_IMAGE_KIND, CHANNEL_IMAGE_MEDIA
 from .container import read_container
 from .document import Document
 from .notices import Kind, Notice
-from .panel import FORMAT_URL, Panel, read_panel
+from .panel import FORMAT_URL, OMITTABLE, Panel, read_panel
 
 _SVG_HASH_METHOD = "c14n2_without_panel_data"
 _TOP = ("format", "schema_version", "schema_revision", "saved_at", "written_by", "core", "quantifications", "figure")
@@ -38,11 +38,14 @@ _TOP = ("format", "schema_version", "schema_revision", "saved_at", "written_by",
 
 @dataclass(frozen=True)
 class Tool:
-    """The writer, recorded as `written_by` in each panel it writes (§3)."""
+    """The writer, recorded as `written_by` in each panel it writes (§3).
+    `extension` is the name of its own extension (§8), the only one it may
+    change: a panel written again carries every other extension as read."""
 
     name: str
     version: str
     build: str | None = None
+    extension: str | None = None
 
     def record(self) -> dict:
         out = {"name": self.name, "version": self.version}
@@ -58,7 +61,21 @@ class Content:
     `json` is the panel to write: for a changed panel, usually
     `panel.to_json()` after the caller's edits. The writer sets `format`,
     the version, `saved_at` and `written_by`, builds `embedded`, and fills
-    `figure` itself; of `figure`, only `crop` is read from `json`.
+    `figure` itself; of `figure`, only `crop` and `style` are read from
+    `json`.
+
+    `json["figure"]["style"]` is the style the figure was drawn with
+    (§6.7): give it whenever you draw the figure again (its labels, not only
+    the rendered image), with the values you drew with, or None for none.
+    Left out, a changed panel whose rendered image is kept keeps the style
+    it was read with, and a new rendered image has none. `panel.to_json()`
+    holds the style as read, so a caller that draws again and keeps that
+    JSON must replace it.
+
+    `extensions` other than the writer's own (`Tool.extension`) are carried
+    as read: changing one, or leaving it out, is refused, unless its name is
+    in `removed_extensions`, the extensions the user chose to remove whole
+    (§8).
 
     `rendered` is a rendered image the caller drew from this core (§6.2)
     over `json["figure"]["crop"]`, as `drawing.render()` draws it;
@@ -72,17 +89,19 @@ class Content:
     value), as §6.2 allows when the channel images cannot be had; its
     `rendered_hash` is computed again and `drawn_from` is kept.
 
-    `channel_images`, `channel_pngs` and `source_metadata` are the payloads
-    the JSON points to, beyond what a changed panel already holds: channel
-    images as pixels, or as channel image PNGs (§5.3) kept byte for byte,
-    and source metadata as (catalog entry, payload)."""
+    `source_channel_images`, `source_channel_pngs` and `source_metadata`
+    are the payloads the JSON points to, beyond what a changed panel already
+    holds: source channel images as pixels, or as source channel image PNGs
+    (§5.3) kept byte for byte, and source metadata as (catalog entry,
+    payload)."""
 
     json: dict
     rendered: np.ndarray | None = None
-    channel_images: list[np.ndarray] = field(default_factory=list)
+    source_channel_images: list[np.ndarray] = field(default_factory=list)
     source_metadata: list[tuple[dict, bytes]] = field(default_factory=list)
-    channel_pngs: list[bytes] = field(default_factory=list)
+    source_channel_pngs: list[bytes] = field(default_factory=list)
     invert_kept: bool = False
+    removed_extensions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -117,15 +136,63 @@ def _now() -> str:
 # --- the assembly-only rewrite ---------------------------------------------------------------------
 
 
+_ASSEMBLY_KEYS = ("id", "member", "members", "name", "omitted")
+
+
+def _good_name(name) -> bool:
+    if not C.is_str(name) or not name or "\r" in name:
+        return False
+    try:
+        _json._check_string(name)
+    except _json._Reject:
+        return False
+    return True
+
+
 def _check_assembly(record, index: int) -> dict | None:
     if record is None:
         return None
-    if (type(record) is not dict or set(record) != {"id", "member", "members"} or not C.is_id(record["id"])
-            or not C.is_int(record["member"]) or not C.is_int(record["members"])
-            or not 1 <= record["member"] <= record["members"]):
-        raise WriteError("An assembly record is an object of exactly 'id' (an ID), 'member' and 'members' "
-                         "(integers, 1 ≤ member ≤ members).", index)
-    return {"id": record["id"], "member": record["member"], "members": record["members"]}
+    if (type(record) is not dict or not {"id", "member", "members"} <= set(record) <= set(_ASSEMBLY_KEYS)
+            or not C.is_id(record["id"]) or not C.is_int(record["member"]) or not C.is_int(record["members"])
+            or not 1 <= record["member"] <= record["members"]
+            or ("name" in record and not _good_name(record["name"]))
+            or ("omitted" in record and not _good_omitted(record["omitted"]))):
+        raise WriteError("An assembly record is an object of 'id' (an ID), 'member' and 'members' "
+                         "(integers, 1 ≤ member ≤ members), and optionally 'name' (a string, not empty, "
+                         "without CR, lone surrogates or Unicode noncharacters) and 'omitted' (different parts of "
+                         f"{', '.join(OMITTABLE)}, at least one).", index)
+    return {key: record[key] for key in _ASSEMBLY_KEYS if key in record}
+
+
+def _good_omitted(omitted) -> bool:
+    return (type(omitted) is list and len(omitted) > 0 and all(type(v) is str and v in OMITTABLE for v in omitted)
+            and len(set(omitted)) == len(omitted))
+
+
+def _omitted_as_read(panel: Panel, record: dict | None) -> dict | None:
+    """§1.7: an assembly-only rewrite draws nothing again, so the parts the
+    set left out of the panel stay as read. A record without `omitted` gets
+    the panel's; one with another refuses."""
+
+    if record is None:
+        return None
+    read = (panel.assembly or {}).get("omitted")
+    if "omitted" not in record:
+        return {**record, "omitted": read} if read is not None else record
+    if record["omitted"] != read:
+        raise WriteError("The parts the set left out of the panel ('omitted') change only when the set is drawn "
+                         "again; an assembly-only rewrite keeps them as read.", panel.index)
+    return record
+
+
+def _name_left_out(panel: Panel, record, notes: list[WriteNote] | None) -> None:
+    """§1.7: a name is written as read unless the user changed it. One the
+    caller's record leaves out is gone; say so."""
+
+    name = (panel.assembly or {}).get("name")
+    if notes is not None and name is not None and type(record) is dict and "name" not in record:
+        notes.append(WriteNote("assembly.name.removed", f"The panel's name in its set ({name!r}) was left out of its "
+                               "new assembly record, so it is no longer written.", panel.index))
 
 
 def new_assembly_id() -> str:
@@ -148,20 +215,28 @@ def _replace_json_member(png: bytes, key: str, value) -> bytes:
     return png[: chunk.offset] + _encode.chunk(b"iTXt", data) + png[chunk.offset + 12 + chunk.length :]
 
 
-def assembly_only(panel: Panel, record: dict | None, allow_loss: bool = False) -> bytes:
+def assembly_only(panel: Panel, record: dict | None, allow_loss: bool = False,
+                  notes: list[WriteNote] | None = None) -> bytes:
     """The panel's carrier PNG with only the top-level `assembly` changed
-    (None takes it out)."""
+    (None takes it out). A `name` read with the panel and left out of
+    `record` is removed, with a note in `notes`: pass the name to keep it."""
 
     record = _check_assembly(record, panel.index)
     if not panel.readable or panel.newer_version or panel.schema_version != C.KNOWN_VERSION:
         raise WriteError("Only the assembly record of a readable panel of this version of the format can be "
                          "changed; this panel keeps its record, and so leaves the assembly.", panel.index)
     raw = panel.raw.get("assembly")
-    if type(raw) is dict and set(raw) - {"id", "member", "members"} and not allow_loss:
+    if type(raw) is dict and set(raw) - set(_ASSEMBLY_KEYS) and not allow_loss:
         raise WriteError("The panel's assembly record has keys this writer does not know; changing it drops them. "
                          "Pass allow_loss=True to go ahead.", panel.index)
+    if (type(raw) is dict and type(raw.get("omitted")) is list and set(map(str, raw["omitted"])) - set(OMITTABLE)
+            and not allow_loss):
+        raise WriteError("The panel's assembly record names parts this writer does not know in 'omitted'; changing "
+                         "it drops them. Pass allow_loss=True to go ahead.", panel.index)
+    record = _omitted_as_read(panel, record)
     if raw == record and ("assembly" in panel.raw) == (record is not None):
         return panel.carrier.png
+    _name_left_out(panel, record, notes)
     return _replace_json_member(panel.carrier.png, "assembly", record)
 
 
@@ -263,17 +338,17 @@ def _build(content: Content, tool: Tool, saved_at: str | None, notes: list[Write
 
     images = dict(images)
     decoded = dict(decoded or {})
-    for pixels in content.channel_images:
+    for pixels in content.source_channel_images:
         if pixels.dtype not in (np.uint8, np.uint16) or pixels.ndim != 2 or 0 in pixels.shape:
-            raise WriteError("A channel image is a (h, w) image of uint8 or uint16.", index)
+            raise WriteError("A source channel image is a (h, w) image of uint8 or uint16.", index)
         key = _hashes.pixel_hash(pixels)
         if key not in images:  # a payload already held keeps its bytes
             images[key] = _channel_entry(pixels)
             decoded[images[key]["png_hash"][len("sha256:"):]] = pixels
-    for png in content.channel_pngs:
+    for png in content.source_channel_pngs:
         pixels, why = _embedded.decode_channel_png(png)
         if pixels is None:
-            raise WriteError(f"A channel image PNG cannot be embedded: {why}.", index)
+            raise WriteError(f"A source channel image PNG cannot be embedded: {why}.", index)
         key = _hashes.pixel_hash(pixels)
         if key not in images:
             images[key] = {"dtype": "uint8" if pixels.dtype == np.uint8 else "uint16", "shape": list(pixels.shape),
@@ -287,7 +362,7 @@ def _build(content: Content, tool: Tool, saved_at: str | None, notes: list[Write
     for source in core.get("sources") if type(core.get("sources")) is list else ():
         if type(source) is not dict:
             continue
-        for channel in source.get("channels") if type(source.get("channels")) is list else ():
+        for channel in source.get("source_channels") if type(source.get("source_channels")) is list else ():
             key = channel.get("pixel_hash") if type(channel) is dict else None
             if key in images and key not in image_catalog:
                 e = images[key]
@@ -298,7 +373,7 @@ def _build(content: Content, tool: Tool, saved_at: str | None, notes: list[Write
             metadata_catalog[key] = metadata[key][0]
     embedded = {}
     if image_catalog:
-        embedded["channel_images"] = image_catalog
+        embedded["source_channel_images"] = image_catalog
     if metadata_catalog:
         embedded["source_metadata"] = metadata_catalog
     if embedded:
@@ -319,6 +394,11 @@ def _build(content: Content, tool: Tool, saved_at: str | None, notes: list[Write
             raise WriteError("Content.rendered must be a grey (h, w) or RGB (h, w, 3) image of uint8 or uint16.", index)
         crop = data["figure"].get("crop") if type(data.get("figure")) is dict else None
         figure = {"crop": crop, "rendered_hash": _hashes.rendered_hash(pixels), "drawn_from": _hashes.core_hash(core)}
+    # §6.7: the style the figure was drawn with, as the caller gives it.
+    if type(data.get("figure")) is dict and "style" in data["figure"]:
+        figure.pop("style", None)
+        if data["figure"]["style"]:
+            figure["style"] = data["figure"]["style"]
 
     # Quantifications measured on another core are dropped (§7.4).
     quant_hash = _hashes.quant_core_hash(core)
@@ -342,7 +422,7 @@ def _build(content: Content, tool: Tool, saved_at: str | None, notes: list[Write
         if key not in _TOP:
             out[key] = value
     try:
-        text = _json.dumps(out)
+        text = _json.dumps(out, keep_floats=("extensions",))
     except (TypeError, ValueError, UnicodeEncodeError) as exc:
         raise WriteError(f"The panel's JSON cannot be written: {exc}.", index) from None
 
@@ -367,6 +447,46 @@ def _build(content: Content, tool: Tool, saved_at: str | None, notes: list[Write
     return png
 
 
+def _same(a, b) -> bool:
+    """Equal as JSON values, number notation included (§2.2: 2 and 2.0
+    differ)."""
+
+    if type(a) is not type(b):
+        return False
+    if type(a) is dict:
+        return a.keys() == b.keys() and all(_same(a[k], b[k]) for k in a)
+    if type(a) is list:
+        return len(a) == len(b) and all(_same(x, y) for x, y in zip(a, b))
+    return a == b
+
+
+def _check_extensions(panel: Panel, content: Content, tool: Tool, notes: list[WriteNote]) -> None:
+    """§8: only the owner writes an extension. Every other one read with the
+    panel is carried untouched, or removed whole when the user chose to."""
+
+    data = content.json if type(content.json) is dict else {}
+    given = data.get("extensions") if type(data.get("extensions")) is dict else {}
+    read_ones = {name: record["value"] for name, record in panel.extensions.items()}
+    index = panel.index
+    for name, value in read_ones.items():
+        if name == tool.extension:
+            continue
+        if name in content.removed_extensions:
+            if name in given:
+                raise WriteError(f"The extension {name!r} is to be removed, but Content.json still holds it.", index)
+            notes.append(WriteNote("extension.removed", f"The extension {name!r} was removed whole, as the user "
+                                   "chose (§8).", index))
+        elif name not in given:
+            raise WriteError(f"The extension {name!r} belongs to another tool and is carried over as read (§8); "
+                             "to remove it whole at the user's choice, name it in Content.removed_extensions.", index)
+        elif not _same(given[name], value):
+            raise WriteError(f"The extension {name!r} belongs to another tool; only its owner changes it (§8).", index)
+    for name in given:
+        if name != tool.extension and name not in read_ones:
+            raise WriteError(f"The extension {name!r} is not this writer's own (Tool.extension) and was not in the "
+                             "panel; only its owner writes it (§8).", index)
+
+
 def rewrite_panel(panel: Panel, content: Content, tool: Tool, *, saved_at: str | None = None,
                   allow_loss: bool = False, notes: list[WriteNote] | None = None) -> bytes:
     """The new carrier PNG of a panel the caller changed. Raises WriteError
@@ -387,15 +507,19 @@ def rewrite_panel(panel: Panel, content: Content, tool: Tool, *, saved_at: str |
                              "be changed (§6.2).", index)
     elif content.invert_kept:
         raise WriteError("Content.invert_kept keeps the previous rendered image; it cannot go with a new one.", index)
+    _check_extensions(panel, content, tool, notes)
+    if type(content.json) is dict:
+        _name_left_out(panel, content.json.get("assembly"), notes)
     view = panel.core
-    images = {k: e for k, e in view.channel_images.items() if e.get("payload") is not None}
+    images = {k: e for k, e in view.source_channel_images.items() if e.get("payload") is not None}
     metadata = {k: (r["entry"], r["payload"]) for k, r in view.source_metadata.items() if r.get("payload") is not None}
-    decoded = {e["png_hash"][len("sha256:"):]: panel.channel_images[k] for k, e in images.items()
-               if k in panel.channel_images and e["png_hash"].startswith("sha256:")}
+    decoded = {e["png_hash"][len("sha256:"):]: panel.source_channel_images[k] for k, e in images.items()
+               if k in panel.source_channel_images and e["png_hash"].startswith("sha256:")}
     png = _build(content, tool, saved_at, notes, index=index, element=panel.element, images=images,
                  metadata=metadata, decoded=decoded,
                  kept=_Kept(panel.carrier.png, panel.carrier.walk,
-                            {k: panel.figure[k] for k in ("crop", "rendered_hash", "drawn_from")},
+                            {k: panel.figure[k] for k in ("crop", "rendered_hash", "drawn_from", "style")
+                             if k != "style" or panel.figure.get("style") is not None},
                             pixels=panel.rendered))
     if panel.figure.get("svg_hash") is not None:
         notes.append(WriteNote("svg_hash.removed", "The panel's svg_hash was left out: it recorded the SVG as an "
@@ -423,6 +547,22 @@ def image_element(png: bytes, x: float = 0, y: float = 0, scale: float = 1) -> s
     n = _json.number
     return (f'<image x="{n(x)}" y="{n(y)}" width="{n(ihdr.width * scale)}" height="{n(ihdr.height * scale)}" '
             f'preserveAspectRatio="xMidYMid meet" href="{_splice.png_data_uri(png).decode("ascii")}"/>')
+
+
+def replace_element(svg: bytes, element: _svgxml.Element, data: bytes) -> bytes:
+    """The SVG with an element read from it (`drawing_of`, for example)
+    replaced by `data`; every other byte stays as it was."""
+
+    start, end = _splice.element_span(svg, element)
+    return _splice.apply(svg, [(start, end, data)])
+
+
+def set_attributes(svg: bytes, element: _svgxml.Element, values: dict[str, str]) -> bytes:
+    """The SVG with attributes of an element read from it set to `values`
+    (the root's `width`, `height` and `viewBox`, for example); every other
+    byte stays as it was."""
+
+    return _splice.set_attributes(svg, element, values)
 
 
 def sign(svg: bytes, pngs) -> Saved:
@@ -485,7 +625,7 @@ def save(document: Document, tool: Tool, *, rewrite: dict[int, Content] | None =
         pngs[index] = rewrite_panel(document.panels[index], change, tool, saved_at=stamp,
                                     allow_loss=allow_loss, notes=notes)
     for index, record in sorted(assembly.items()):
-        png = assembly_only(document.panels[index], record, allow_loss=allow_loss)
+        png = assembly_only(document.panels[index], record, allow_loss=allow_loss, notes=notes)
         if png is not document.panels[index].carrier.png:
             pngs[index] = png
     if not pngs:

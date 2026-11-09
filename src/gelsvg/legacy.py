@@ -17,13 +17,12 @@ import xml.etree.ElementTree as ET
 import numpy as np
 
 from . import _carrier, _check as C, _datauri, _formal, _hashes, _json, _png, _splice, _svghash, _svgxml
+from ._core import ANNOTATION_SIDES
 from .container import read_container
 from .writer import Content, Tool, WriteError, _build, _Kept, _replace_json_member
 
 MYWB_EXTENSION = "https://mybioapps.com/mywb"
 _HEX64 = re.compile(r"[0-9a-f]{64}")
-_SIZE = re.compile(r"\s*(\d+(?:\.\d+)?)\s*(kda|kd|bp|kbp|kb|nt)\s*", re.IGNORECASE)
-_UNITS = {"kda": "kDa", "kd": "kDa", "bp": "bp", "kbp": "kb", "kb": "kb", "nt": "nt"}
 _ROLES = ("blot", "marker")
 
 
@@ -139,7 +138,7 @@ class _Old:
 
 def _sources(old: dict, schema: int, payloads: dict, notes: list[str]):
     """`core.sources`, the payloads they point to, and per role (source
-    id, channel, element pixel hash)."""
+    id, source channel)."""
 
     info = old.get("source_image_info") or {}
     assets_root = (old.get("embedded_png_info") or {}).get("source_assets") or {}
@@ -161,7 +160,6 @@ def _sources(old: dict, schema: int, payloads: dict, notes: list[str]):
         file_hash = _hex_hash(info.get(f"{role}_sha256"))
         if file_hash:
             record["file_hash"] = file_hash
-        pixel_hash = None
         if view is not None and view.get("bundle_id") in bundles:
             bundle = bundles[view["bundle_id"]]
             names = ["gray"] if bundle.get("color_format") == "grayscale" else ["red", "green", "blue"]
@@ -181,10 +179,8 @@ def _sources(old: dict, schema: int, payloads: dict, notes: list[str]):
                                      "they are not embedded.")
                 channels.append(channel)
             record["dtype"], record["shape"] = bundle.get("dtype"), bundle.get("shape")
-            record["channels"] = channels
+            record["source_channels"] = channels
             selected = view.get("selected_channel") or "gray"
-            if selected == "average":
-                pixel_hash = _hex_hash(view.get("selected_pixel_sha256"))
             meta_id = view.get("file_metadata_id")
             if meta_id is not None:
                 converted = _metadata(records.get(meta_id), payloads, notes, role)
@@ -197,7 +193,7 @@ def _sources(old: dict, schema: int, payloads: dict, notes: list[str]):
         else:
             selected = info.get(f"{role}_rgb_channel") or "gray"
             names = ["gray"] if selected == "gray" else ["red", "green", "blue"]
-            record["channels"] = [{"name": n} for n in names]
+            record["source_channels"] = [{"name": n} for n in names]
             shape = info.get(f"{role}_image_shape")
             if C.is_shape(shape):
                 record["shape"] = list(shape)
@@ -206,16 +202,16 @@ def _sources(old: dict, schema: int, payloads: dict, notes: list[str]):
                              "hash for it until its source file is read again (Appendix B).")
             share = ("file", file_hash or record.get("file_name") or role)
         if share in keys:
-            roles[role] = (keys[share], selected, pixel_hash)
+            roles[role] = (keys[share], selected)
             continue
         source_id = f"s{len(sources) + 1}"
         keys[share] = source_id
         ordered = {"id": source_id}
-        for key in ("file_name", "file_hash", "dtype", "shape", "channels", "source_metadata"):
+        for key in ("file_name", "file_hash", "dtype", "shape", "source_channels", "source_metadata"):
             if record.get(key) is not None:
                 ordered[key] = record[key]
         sources.append(ordered)
-        roles[role] = (source_id, selected, pixel_hash)
+        roles[role] = (source_id, selected)
     return sources, roles, images, metadata
 
 
@@ -247,8 +243,63 @@ def _metadata(record, payloads: dict, notes: list[str], role: str):
         return lost(str(exc))
 
 
+@dataclass
+class _Labels:
+    """What the old sample labels say of how they were drawn: whether the
+    old MyWB could draw the table or rotated form at all, the table's
+    divider (as the old MyWB read it) and its number of rows, and the angle
+    of each rotated lane (Appendix B)."""
+
+    drawable: bool = False
+    separator: int | None = None
+    row_count: int = 0
+    angles: list[float] = field(default_factory=list)
+    merged: bool | None = None
+    """Whether the table drew the same values of lanes next to each other
+    once; None when its lane did not say (drawn by the default, not moved)."""
+
+
+# The table's `cell_render_mode`s that drew the same values once, across the
+# lanes (§6.7 `merge_same_values`); any other value drew each lane's.
+_MERGING_MODES = {"underline_span": "underline", "bracket_span": "bracket"}
+
+
+def _in_roi_x(x, roi: dict) -> bool:
+    """Whether a lane is within the ROI's breadth, as the old MyWB drew a
+    table only of those lanes."""
+
+    roi_x, roi_w = roi.get("roi_x"), roi.get("roi_w")
+    if not (C.is_number(roi_x) and C.is_number(roi_w)):
+        return True
+    return min(roi_x, roi_x + roi_w) <= x < max(roi_x, roi_x + roi_w)
+
+
+def _old_float(value) -> float | None:
+    """A number as the old MyWB read it (Python's float()), or None."""
+
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _old_separator(value, row_count: int) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    number = _old_float(value)
+    if number is None or not np.isfinite(number) or not number.is_integer():
+        return None
+    return min(max(0, int(number)), row_count)
+
+
+def _old_angle(value) -> float:
+    angle = _old_float(value)
+    return min(90.0, max(-90.0, 45.0 if angle is None else angle))
+
+
 def _samples(old: dict, label_type: str, notes: list[str], extension: dict):
-    """`core.samples` lanes and conditions from `sample_label_info`."""
+    """`core.samples` lanes and conditions from `sample_label_info`, and
+    what the labels say of how they were drawn (`_Labels`)."""
 
     labels = old.get("sample_label_info") or {}
     readable = []
@@ -275,9 +326,21 @@ def _samples(old: dict, label_type: str, notes: list[str], extension: dict):
                 notes.append(f"The {label_type} label of lane {key!r} could not be read; its text is kept as details.")
 
     conditions, values = [], {key: {} for key, _ in readable}
+    drawn = _Labels()
     if label_type == "table" and any(parsed.values()):
         by_x = sorted((k for k, _ in readable if parsed.get(k)), key=lambda k: labels[k]["x_spinbox"])
         count = max(len(parsed[k]["rows"]) for k in by_x)
+        drawn.drawable, drawn.row_count = True, count
+        # The old MyWB took the divider of the leftmost lane that had one.
+        drawn.separator = next((sep for sep in (_old_separator(parsed[k].get("row_separator_index"), len(parsed[k]["rows"]))
+                                                for k in by_x) if sep is not None), None)
+        if drawn.separator is not None:
+            drawn.separator = min(drawn.separator, count)
+        # It drew the table by the settings of its leftmost lane within the ROI.
+        roi = old.get("roi_info") if type(old.get("roi_info")) is dict else {}
+        inside = [k for k in by_x if _in_roi_x(labels[k]["x_spinbox"], roi)]
+        mode = parsed[(inside or by_x)[0]].get("cell_render_mode")
+        drawn.merged = (mode in _MERGING_MODES) if mode in ("per_lane", *_MERGING_MODES) else None
         for i in range(count):
             heading = next((parsed[k]["rows"][i][0] for k in by_x if i < len(parsed[k]["rows"]) and parsed[k]["rows"][i][0]), "")
             others = {parsed[k]["rows"][i][0] for k in by_x if i < len(parsed[k]["rows"])} - {heading, ""}
@@ -293,6 +356,9 @@ def _samples(old: dict, label_type: str, notes: list[str], extension: dict):
                     values[k][condition["id"]] = _text(parsed[k]["rows"][i][1])
     elif label_type == "rotated" and readable:
         conditions.append({"id": "r1"})
+        # A label the old MyWB could not read was drawn rotated by 45° (its default).
+        drawn.drawable = True
+        drawn.angles = [_old_angle(parsed[k]["angle"]) if parsed.get(k) else 45.0 for k, _ in readable]
         for key, item in readable:
             p = parsed.get(key)
             text = p.get("rotated_label", p.get("label", "")) if p else ""
@@ -306,7 +372,13 @@ def _samples(old: dict, label_type: str, notes: list[str], extension: dict):
         p = parsed.get(key)
         details = p.get("label", "") if p else item["label"]
         if p:
-            settings[key] = {k: v for k, v in p.items() if k not in ("version", "label", "rows", "rotated_label")}
+            # The divider is figure.style's split (Appendix B); the angle goes there when every lane has one.
+            settings[key] = {k: v for k, v in p.items()
+                             if k not in ("version", "label", "rows", "rotated_label", "row_separator_index",
+                                          "cell_render_mode")}
+            # Whether to merge is figure.style's; the shape of the mark, MyWB's (Appendix B).
+            if _MERGING_MODES.get(p.get("cell_render_mode")) == "bracket":
+                settings[key]["span_shape"] = "bracket"
         if not re.fullmatch(r"[1-9][0-9]*", key):
             notes.append(f"The sample label {key!r} has no lane number; it was dropped.")
             continue
@@ -317,9 +389,13 @@ def _samples(old: dict, label_type: str, notes: list[str], extension: dict):
             if values[key]:
                 lane["values"] = values[key]
         lanes.append(lane)
+    if label_type == "rotated" and drawn.angles and len(set(drawn.angles)) == 1:
+        for item in settings.values():
+            item.pop("angle", None)
+    settings = {k: v for k, v in settings.items() if v}
     if settings:
         extension["sample_labels"] = settings
-    return lanes, conditions
+    return lanes, conditions, drawn
 
 
 def _bands(old: dict, lanes: list[dict], notes: list[str]):
@@ -376,13 +452,50 @@ def _markers(old: dict, notes: list[str]) -> list[dict]:
                 or not isinstance(item.get("label"), str) or not C.is_id(key)):
             notes.append(f"The marker label {key!r} could not be read and was dropped.")
             continue
-        label = {"id": key, "x": item["x_spinbox"], "y": item["y_spinbox"], "label": _text(item["label"])}
-        match = _SIZE.fullmatch(item["label"])
-        if match and float(match.group(1)) > 0:
-            number = float(match.group(1))
-            label["size"] = {"value": int(number) if number.is_integer() else number, "unit": _UNITS[match.group(2).lower()]}
-        out.append(label)
+        out.append({"id": key, "x": item["x_spinbox"], "y": item["y_spinbox"], "label": _text(item["label"])})
     return out
+
+
+def _side(value) -> str | None:
+    return value if value in ("left", "right") else None
+
+
+def annotation_side(old: dict, picture_size: tuple[int, int] | None = None) -> str:
+    """The side, left or right, an old document drew its one annotation on:
+    its `annotation_pos` when that is set; else the side opposite the marker
+    labels -- opposite `marker_pos` when that is set, and with each label
+    placed by itself, the side with fewer of them drawn, a tie going right.
+    A label is drawn when it is level with the picture, on the left when it
+    is left of the picture's middle. `picture_size` (width, height) is the
+    picture's; without it, the ROI's, and without that the labels are not
+    counted."""
+
+    style = old.get("svg_style") if type(old.get("svg_style")) is dict else {}
+    misc = old.get("misc_info") if type(old.get("misc_info")) is dict else {}
+    chosen = _side(style.get("annotation_pos"))
+    if chosen:
+        return chosen
+    schema = old.get("schema_version")
+    marker_pos = _side(misc.get("marker_pos") if type(schema) is int and schema <= 3 else style.get("marker_pos"))
+    if marker_pos:
+        return "right" if marker_pos == "left" else "left"
+    roi = old.get("roi_info") if type(old.get("roi_info")) is dict else {}
+    x0, y0 = (roi.get(k) if C.is_number(roi.get(k)) else 0 for k in ("roi_x", "roi_y"))
+    size = picture_size or (roi.get("roi_w"), roi.get("roi_h"))
+    if not all(C.is_number(v) for v in size):
+        return "right"
+    width, height = size
+    left = right = 0
+    for item in (old.get("marker_label_info") or {}).values() if type(old.get("marker_label_info")) is dict else ():
+        if type(item) is not dict or not C.is_number(item.get("x_spinbox")) or not C.is_number(item.get("y_spinbox")):
+            continue
+        if not 0 <= item["y_spinbox"] - y0 <= height:
+            continue
+        if item["x_spinbox"] - x0 < width / 2:
+            left += 1
+        else:
+            right += 1
+    return "left" if right > left else "right"
 
 
 def _rendered(png: bytes):
@@ -400,16 +513,120 @@ def _rendered(png: bytes):
 class Mapped:
     """A schema 6 JSON (an old MyWB document's, or MyWB's own while it holds a
     document) as a GelSVG panel: its core, the MyWB extension's content
-    (without `based_on`), and the payloads they point to."""
+    (without `based_on`), the payloads they point to, and `style`, the
+    figure's style (`figure.style`, §6.7) as the old MyWB drew it, empty
+    when nothing was written that says."""
 
     schema_version: int
     core: dict
     extension: dict
-    channel_pngs: list[bytes]
+    source_channel_pngs: list[bytes]
     source_metadata: list[tuple[dict, bytes]]
     notes: list[str]
     roi: dict | None
     old_svg_hash: str | None
+    style: dict = field(default_factory=dict)
+
+
+# Appendix B: the keys of `svg_style` that §6.7 covers. They move to
+# `figure.style` with the values the old MyWB drew with, and leave the
+# extension; `annotation_pos` only decides the side in `core.annotations`.
+_FONT_SIZES = {"sample_label_font_size": "sample_label", "sample_details_font_size": "details_list",
+               "marker_label_font_size": "marker_label", "band_label_font_size": "row_name",
+               "annotation_font_size": "annotation"}
+_STYLE_KEYS = (*_FONT_SIZES, "font_family", "image_scale_percent", "image_border_stroke_width", "sample_pos",
+               "hide_sample_details", "marker_pos", "band_label_pos", "band_label_visible", "annotation_pos")
+
+
+def _old_bool(value) -> bool:
+    """A setting turned on or off, as the old MyWB read it."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return False
+
+
+def _old_clamped(value, low: float) -> float | None:
+    number = _old_float(value)
+    if number is None:
+        return None  # drawn with the default: not moved
+    number = max(low, number)
+    return number if np.isfinite(number) else None
+
+
+def _old_side(value, sides: tuple[str, ...]) -> str | None:
+    """A side the old MyWB was set to draw on, or None for one it decided
+    itself (`auto`, and absent or unreadable): where it then drew is not
+    known here (Appendix B)."""
+
+    return value if value in sides else None
+
+
+def _style(old: dict, schema, misc: dict, label_type, labels: _Labels, row_ids: dict) -> dict:
+    """`figure.style` from the old settings (Appendix B): only the keys
+    written, with the values the old MyWB drew with."""
+
+    svg_style = dict(old["svg_style"]) if type(old.get("svg_style")) is dict else {}
+    for key in ("marker_pos", "sample_pos"):  # schema 3 kept them in misc_info
+        if type(schema) is int and schema <= 3 and isinstance(misc.get(key), str):
+            svg_style[key] = misc[key]
+    style: dict = {}
+
+    def put(group: str | None, key: str, value) -> None:
+        if value is not None:
+            (style.setdefault(group, {}) if group else style)[key] = value
+
+    if isinstance(svg_style.get("font_family"), str):
+        put(None, "font_family", svg_style["font_family"].strip().strip("\"'") or None)
+    if "image_scale_percent" in svg_style:
+        percent = _old_clamped(svg_style["image_scale_percent"], 0)
+        put(None, "image_scale", None if percent is None else max(percent, 0.001) / 100)
+    if "image_border_stroke_width" in svg_style:
+        put(None, "image_border_width", _old_clamped(svg_style["image_border_stroke_width"], 0))
+
+    form = {"basic": "numbers", "table": "table", "rotated": "rotated"}.get(label_type) if isinstance(label_type, str) else None
+    if form in ("table", "rotated") and not labels.drawable:
+        form = "numbers"  # the old MyWB drew lane numbers instead
+    put("sample_label", "form", form)
+    side = _old_side(svg_style.get("sample_pos"), ("top", "bottom"))
+    automatic = None if side is None else False
+    divider, count = labels.separator, labels.row_count
+    if form == "table" and divider is not None and count:
+        before, after = divider > 0, divider < count
+        if side is None:
+            # Left automatic (absent or unreadable is automatic too), the old MyWB drew the rows
+            # before the divider above the image and the rest below; an empty part was not drawn.
+            side = "split" if before and after else ("bottom" if after else "top")
+            automatic = True
+            if side == "split":
+                put("sample_label", "bottom_from", f"t{divider + 1}")
+        elif before and after:
+            put("sample_label", "bottom_from", f"t{divider + 1}")  # kept, not used (§6.7)
+    put("sample_label", "side", side)
+    put("sample_label", "side_automatic", automatic)
+    if form == "table":
+        put("sample_label", "merge_same_values", labels.merged)
+    if form == "rotated" and len(set(labels.angles)) == 1:
+        put("sample_label", "angle", labels.angles[0])
+
+    for key, group in _FONT_SIZES.items():
+        if key in svg_style:
+            put(group, "font_size", _old_clamped(svg_style[key], 0.5))
+    if "hide_sample_details" in svg_style:
+        put("details_list", "visible", not _old_bool(svg_style["hide_sample_details"]))
+    for group, key in (("marker_label", "marker_pos"), ("row_name", "band_label_pos")):
+        side = _old_side(svg_style.get(key), ("left", "right"))
+        put(group, "side", side)
+        put(group, "side_automatic", None if side is None else False)
+    hidden = [row_ids[n] for n in misc.get("band_label_hidden_rows") or [] if type(n) is int and n in row_ids]
+    if "band_label_visible" in svg_style and not _old_bool(svg_style["band_label_visible"]):
+        hidden = list(row_ids.values())  # no row named: every row (§6.7 has no `visible`)
+    put("row_name", "hidden_rows", list(dict.fromkeys(hidden)) or None)
+    return style
 
 
 def converted_from(old: dict) -> dict:
@@ -422,12 +639,14 @@ def converted_from(old: dict) -> dict:
     return {"schema_version": old.get("schema_version"), **({"written_by": written} if written else {})}
 
 
-def from_schema6(old: dict, payloads: dict, *, picture_depth: int | None = None, converted: bool = True) -> Mapped:
+def from_schema6(old: dict, payloads: dict, *, picture_depth: int | None = None,
+                 picture_size: tuple[int, int] | None = None, converted: bool = True) -> Mapped:
     """Map a schema 3–6 JSON by Appendix B. `payloads` maps (codec, SHA-256
     hex) to the old `myWb` payloads (codec 1 plane PNGs, codec 2 metadata).
     `picture_depth` is the old picture's bit depth when there is one: it
-    decides `output_bit_depth`. With `converted`, the extension records the
-    schema and writer converted from."""
+    decides `output_bit_depth`; `picture_size` (width, height), the side an
+    old annotation was drawn on (`annotation_side`). With `converted`, the
+    extension records the schema and writer converted from."""
 
     notes: list[str] = []
     schema = old.get("schema_version")
@@ -444,21 +663,21 @@ def from_schema6(old: dict, payloads: dict, *, picture_depth: int | None = None,
     if not C.is_number(rotation) or not -180 <= rotation < 180:
         raise LegacyError("'filter_data_b.rotation' is not a number from −180 up to 180.")
 
-    source_b, channel_b, hash_b = roles["blot"]
-    blot = {"id": "blot", "source": source_b, "source_channel": channel_b,
+    # Appendix B: the blot is the one drawn panel channel and the reference
+    # channel; the marker image becomes a marker channel, not drawn.
+    source_b, channel_b = roles["blot"]
+    blot = {"id": "blot", "drawn": True, "source": source_b, "source_channel": channel_b,
             "invert": _flag(fb.get("invert"), "filter_data_b.invert"), "contrast": _contrast(fb.get("contrast"), "filter_data_b.contrast")}
-    if hash_b:
-        blot["pixel_hash"] = hash_b
-    core: dict = {"sources": sources, "blot": [blot]}
+    channels = [blot]
     if "marker" in roles:
-        source_m, channel_m, hash_m = roles["marker"]
+        source_m, channel_m = roles["marker"]
         turn, flip = _marker_turn_flip(_turn(fm.get("rotation_offset", 0), "filter_data_m.rotation_offset"),
                                        _flag(fm.get("flip"), "filter_data_m.flip"), turn_b, flip_b)
-        marker = {"source": source_m, "source_channel": channel_m, "turn": turn, "flip": flip,
-                  "invert": _flag(fm.get("invert"), "filter_data_m.invert"), "contrast": _contrast(fm.get("contrast"), "filter_data_m.contrast")}
-        if hash_m:
-            marker["pixel_hash"] = hash_m
-        core["marker"] = marker
+        channels.append({"id": "marker", "role": "marker", "drawn": False, "source": source_m,
+                         "source_channel": channel_m, "turn": turn, "flip": flip,
+                         "invert": _flag(fm.get("invert"), "filter_data_m.invert"),
+                         "contrast": _contrast(fm.get("contrast"), "filter_data_m.contrast")})
+    core: dict = {"sources": sources, "channels": channels, "reference_channel": "blot"}
     core["orientation"] = {"turn": turn_b, "flip": flip_b, "rotation": rotation}
     extension["highlight_saturated"] = {r: bool(f.get("highlight_saturated", False)) for r, f in (("blot", fb), ("marker", fm))}
 
@@ -496,8 +715,7 @@ def from_schema6(old: dict, payloads: dict, *, picture_depth: int | None = None,
     core["output_bit_depth"] = depth
 
     label_type = misc.get("sample_label_type") if misc.get("sample_label_type") in ("basic", "table", "rotated") else "basic"
-    extension["sample_label_type"] = label_type
-    lanes, conditions = _samples(old, label_type, notes, extension)
+    lanes, conditions, labels = _samples(old, label_type, notes, extension)
     rows, bands, row_ids = _bands(old, lanes, notes)
     samples = {}
     if conditions:
@@ -507,26 +725,34 @@ def from_schema6(old: dict, payloads: dict, *, picture_depth: int | None = None,
     if samples:
         core["samples"] = samples
     if rows:
-        core["rows"] = rows
+        core["rows"] = [{**row, "channel": "blot"} for row in rows]
     if bands:
         core["bands"] = bands
     markers = _markers(old, notes)
     if markers:
         core["markers"] = markers
-    if isinstance(misc.get("annotation_text"), str) and misc["annotation_text"]:
-        core["annotation"] = _text(misc["annotation_text"])
+    unit = misc.get("marker_unit")  # MyWB's own, while it holds a document; no old document has one
+    if isinstance(unit, str) and unit.strip():
+        core["marker_unit"] = _text(unit, backslash_n=False)
+    annotations = {}
+    if type(misc.get("annotations")) is dict:  # MyWB's own, while it holds a document
+        annotations = {side: _text(misc["annotations"][side]) for side in ANNOTATION_SIDES
+                       if isinstance(misc["annotations"].get(side), str) and misc["annotations"][side]}
+    elif isinstance(misc.get("annotation_text"), str) and misc["annotation_text"]:
+        annotations = {annotation_side(old, picture_size): _text(misc["annotation_text"])}
+    if annotations:
+        core["annotations"] = annotations
     if isinstance(misc.get("note"), str) and misc["note"]:
         core["note"] = _text(misc["note"], backslash_n=False)
 
-    hidden = [row_ids[n] for n in misc.get("band_label_hidden_rows") or [] if type(n) is int and n in row_ids]
-    if hidden:
-        extension["band_label_hidden_rows"] = hidden
-    for key in ("svg_style", "quantification_state"):
-        if type(old.get(key)) is dict:
-            extension[key] = old[key]
-    for key in ("marker_pos", "sample_pos"):  # schema 3 kept them in misc_info
-        if schema <= 3 and isinstance(misc.get(key), str):
-            extension.setdefault("svg_style", {})[key] = misc[key]
+    style = _style(old, schema, misc, misc.get("sample_label_type"), labels, row_ids)
+    # What §6.7 covers is in `style` now, not the extension (§8).
+    rest = {k: v for k, v in old["svg_style"].items() if k not in _STYLE_KEYS} \
+        if type(old.get("svg_style")) is dict else {}
+    if rest:
+        extension["svg_style"] = rest
+    if type(old.get("quantification_state")) is dict:
+        extension["quantification_state"] = old["quantification_state"]
 
     old_svg_hash = None
     integrity = old.get("svg_integrity") if type(old.get("svg_integrity")) is dict else {}
@@ -536,7 +762,7 @@ def from_schema6(old: dict, payloads: dict, *, picture_depth: int | None = None,
     elif integrity.get("hash") and converted:
         notes.append("The old document's SVG hash was made in a way that cannot be checked again; it was not carried over.")
     return Mapped(schema, core, extension, [e["payload"] for e in images.values()], list(metadata.values()), notes,
-                  roi, old_svg_hash)
+                  roi, old_svg_hash, style)
 
 
 def _convert_one(item: _Old, tool: Tool, saved_at: str | None) -> tuple[ConvertedPanel, str | None]:
@@ -549,7 +775,7 @@ def _convert_one(item: _Old, tool: Tool, saved_at: str | None) -> tuple[Converte
                 damaged.append("An old myWb chunk was damaged and was not used.")
             else:
                 payloads[(got[0], hashlib.sha256(got[1]).hexdigest())] = got[1]
-    mapped = from_schema6(item.data, payloads, picture_depth=ihdr.bit_depth)
+    mapped = from_schema6(item.data, payloads, picture_depth=ihdr.bit_depth, picture_size=(ihdr.width, ihdr.height))
     notes = damaged + mapped.notes
     roi = mapped.roi
     fallback = (item.data.get("embedded_png_info") or {}).get("fallback_mode") or item.image.attributes.get("data-mywb-fallback-mode")
@@ -558,12 +784,14 @@ def _convert_one(item: _Old, tool: Tool, saved_at: str | None) -> tuple[Converte
     else:
         crop = {"x": max(roi["x"], 0), "y": max(roi["y"], 0), "w": ihdr.width, "h": ihdr.height}
     figure = {"crop": crop, "rendered_hash": _hashes.rendered_hash(rendered), "drawn_from": _hashes.core_hash(mapped.core)}
+    if mapped.style:
+        figure["style"] = mapped.style
     if mapped.old_svg_hash:
         figure.update(svg_hash=mapped.old_svg_hash, svg_hash_method="c14n2_without_panel_data")
     panel = {"core": mapped.core, "figure": figure,
              "extensions": {MYWB_EXTENSION: {"based_on": _hashes.core_hash(mapped.core), **mapped.extension}}}
     try:
-        png = _build(Content(panel, channel_pngs=mapped.channel_pngs, source_metadata=mapped.source_metadata), tool,
+        png = _build(Content(panel, source_channel_pngs=mapped.source_channel_pngs, source_metadata=mapped.source_metadata), tool,
                      saved_at, [], index=None, element=item.image, images={}, metadata={},
                      kept=_Kept(item.png, walk, figure, legacy=True))
     except WriteError as exc:

@@ -9,7 +9,7 @@ import copy
 
 from . import _json
 from ._check import Context
-from ._core import CoreView, read_core
+from ._core import ROLES, CoreView, read_core
 from ._quant import read_quantifications
 
 
@@ -23,25 +23,29 @@ def _source(source: dict, metadata_keys: set[str]) -> dict:
     out = {"id": source["id"]}
     _put(out, source, "file_name", "file_hash", "dtype", "shape")
     channels = []
-    for channel in source["channels"]:
+    for channel in source["source_channels"]:
         item = {"name": channel["name"]}
         if channel.get("pixel_hash_known"):
             item["pixel_hash"] = channel["pixel_hash"]
         channels.append(item)
-    out["channels"] = channels
+    out["source_channels"] = channels
     if source.get("source_metadata") in metadata_keys:
         out["source_metadata"] = source["source_metadata"]
     return out
 
 
-def _view_element(element: dict, first: bool, marker: bool) -> dict:
-    out = {} if marker else {"id": element["id"]}
+def _panel_channel(element: dict, reference: bool) -> dict:
+    out = {"id": element["id"]}
+    _put(out, element, "name")
+    if element["role"] in ROLES:
+        out["role"] = element["role"]  # a newer role is not written back (rule 6)
+    out["drawn"] = element["drawn"]
     out["source"] = element["source"]
     out["source_channel"] = element["source_channel"]
-    if not first:
-        out["turn"], out["flip"] = element["turn"], element["flip"]
+    if not reference:
+        _put(out, element, "turn", "flip")
     out["invert"], out["contrast"] = element["invert"], element["contrast"]
-    _put(out, element, "color", "pixel_hash")
+    _put(out, element, "color")
     return out
 
 
@@ -62,10 +66,12 @@ def _core(view: CoreView, metadata_keys: set[str]) -> dict:
     core: dict = {}
     if view.sources is not None:
         core["sources"] = [_source(s, metadata_keys) for s in view.sources]
-    if view.blot is not None:
-        core["blot"] = [_view_element(e, i == 0, marker=False) for i, e in enumerate(view.blot)]
-    if view.marker is not None:
-        core["marker"] = _view_element(view.marker, False, marker=True)
+    if view.channels is not None:
+        core["channels"] = [_panel_channel(e, e["id"] == view.reference_channel) for e in view.channels]
+    if view.blend is not None:
+        core["blend"] = view.blend
+    if view.reference_channel is not None:
+        core["reference_channel"] = view.reference_channel
     if view.orientation is not None:
         core["orientation"] = view.orientation
     if view.roi is not None:
@@ -93,12 +99,12 @@ def _core(view: CoreView, metadata_keys: set[str]) -> dict:
     if view.markers:
         markers = []
         for label in view.markers:
-            item = {"id": label["id"], "x": label["x"], "y": label["y"], "label": label["label"]}
-            _put(item, label, "size")
-            markers.append(item)
+            markers.append({"id": label["id"], "x": label["x"], "y": label["y"], "label": label["label"]})
         core["markers"] = markers
-    if view.annotation is not None:
-        core["annotation"] = view.annotation
+    if view.marker_unit is not None:
+        core["marker_unit"] = view.marker_unit
+    if view.annotations:
+        core["annotations"] = dict(view.annotations)
     if view.note is not None:
         core["note"] = view.note
     return core
@@ -113,8 +119,8 @@ def _quantifications(items: list[dict]) -> list[dict]:
         for v in q["values"]:
             if v["region"] is None:
                 continue
-            item = {"lane": v["lane"]}
-            _put(item, v, "row")
+            item = {}
+            _put(item, v, "lane", "row")
             item.update(region=v["region"], raw=v["raw"], signal=v["signal"])
             _put(item, v, "background", "peak")
             values.append(item)
@@ -129,8 +135,8 @@ def _quantifications(items: list[dict]) -> list[dict]:
 
 def _settle(core: dict, quantifications: list[dict], metadata_keys: set[str]):
     """Read the JSON again until reading it drops nothing more. Leaving
-    something out can make another thing invalid (a row's `channel` once
-    the blot has one element, a lane whose only band was dropped), and
+    something out can make another thing invalid (a lane whose only band
+    was dropped, a row whose panel channel was dropped), and
     rule 6 forbids writing what is invalid."""
 
     for _ in range(16):

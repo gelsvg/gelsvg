@@ -189,7 +189,8 @@ _TAG_END = re.compile(rb"[ \t\r\n]*(/?)>")
 
 def element_span(svg: bytes, element: Element) -> tuple[int, int]:
     """The bytes of an element, from its start tag to the end of its end
-    tag (an element whose content holds no element of the same name)."""
+    tag. An element not read from this SVG (no `end_tag`) is found by its
+    name, and must hold no element of the same name."""
 
     match = _NAME.match(svg, element.offset)
     name = match.group(0)[1:]
@@ -199,8 +200,37 @@ def element_span(svg: bytes, element: Element) -> tuple[int, int]:
     close = _TAG_END.match(svg, pos)
     if close.group(1):
         return element.offset, close.end()
+    if element.end_tag >= 0:
+        return element.offset, svg.index(b">", element.end_tag) + 1
     end = re.compile(rb"</" + re.escape(name) + rb"[ \t\r\n]*>").search(svg, close.end())
     return element.offset, end.end()
+
+
+def set_attributes(svg: bytes, element: Element, values: dict[str, str]) -> bytes:
+    """The SVG with attributes of the element's start tag given new values,
+    and those it lacks added at the end of the tag. Values are escaped here;
+    names are written as given (no namespace prefix is looked up)."""
+
+    spans = {name: (start, end) for name, start, end in _start_tag_attributes(svg, element.offset)}
+    edits, added = [], b""
+    for name, value in values.items():
+        data = _escape(value)
+        if name in spans:
+            edits.append((*spans[name], data))
+        else:
+            added += b" " + name.encode("utf-8") + b'="' + data + b'"'
+    if added:
+        match = _NAME.match(svg, element.offset)
+        pos = match.end()
+        while (m := _ATTRIBUTE.match(svg, pos)) is not None:
+            pos = m.end()
+        edits.append((pos, pos, added))
+    return apply(svg, edits)
+
+
+def _escape(value: str) -> bytes:
+    return (value.replace("&", "&amp;").replace("<", "&lt;").replace('"', "&quot;")
+            .replace("\t", "&#9;").replace("\n", "&#10;").replace("\r", "&#13;").encode("utf-8"))
 
 
 def apply(svg: bytes, edits: list[tuple[int, int, bytes]]) -> bytes:

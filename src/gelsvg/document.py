@@ -6,10 +6,10 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, field
 
-from . import _svghash
+from . import _svghash, _svgxml
 from .container import Container, LegacySlot, read_container
 from .notices import Kind, Notice
-from .panel import Panel, read_panel
+from .panel import Panel, read_assembly_only, read_panel
 
 
 @dataclass
@@ -59,6 +59,44 @@ def read(svg: bytes) -> Document:
     _check_svg_hash(doc, svg)
     _group_assemblies(doc)
     return doc
+
+
+def read_sets(svg: bytes) -> Document:
+    """A document read only as far as its panels and their assemblies
+    (§1.2, §1.7): of each panel, its `assembly` alone, nothing decoded or
+    checked. For listing a file's panels quickly; `read` reads them."""
+
+    container = read_container(svg)
+    doc = Document(container=container, notices=list(container.notices), svg=svg)
+    for slot in container.panels:
+        doc.panels.append(read_assembly_only(slot.index, slot.element, slot.carrier))
+    _group_assemblies(doc)
+    return doc
+
+
+def drawing_of(doc: Document, indexes) -> _svgxml.Element | None:
+    """The element that draws these panels and no other: the innermost
+    element enclosing the `image` elements of all of them (for one panel, the
+    element holding its `image`). None when that is the root `svg` element,
+    or when it encloses another panel's `image` too. A writer that redraws
+    them replaces this element, keeping the rest of the SVG as read (§1.7: a
+    writer draws an assembly in a single `<g>`)."""
+
+    images = [doc.panels[i].element for i in indexes]
+    if not images:
+        return None
+    common = list(images[0].ancestors())
+    for image in images[1:]:
+        enclosing = {id(e) for e in image.ancestors()}
+        common = [e for e in common if id(e) in enclosing]
+    if not common or common[0].parent is None:
+        return None
+    element = common[0]
+    wanted = {id(image) for image in images}
+    for panel in doc.panels:
+        if id(panel.element) not in wanted and any(a is element for a in panel.element.ancestors()):
+            return None
+    return element
 
 
 def _check_svg_hash(doc: Document, svg: bytes) -> None:

@@ -50,8 +50,8 @@ def test_a_source_image_as_json():
     pixels = rgb()
     source = read_source(F.tiff(pixels), file_name="blot.tif")
     data = source.to_json("s1")
-    assert [c["name"] for c in data["channels"]] == ["red", "green", "blue"]
-    assert data["channels"][1]["pixel_hash"] == pixel_hash(np.ascontiguousarray(pixels[..., 1]))
+    assert [c["name"] for c in data["source_channels"]] == ["red", "green", "blue"] and "channels" not in data
+    assert data["source_channels"][1]["pixel_hash"] == pixel_hash(np.ascontiguousarray(pixels[..., 1]))
     assert (data["dtype"], data["shape"], data["file_name"]) == ("uint8", [5, 7], "blot.tif")
     assert data["source_metadata"].startswith("sha256:") and data["file_hash"].startswith("sha256:")
 
@@ -325,14 +325,16 @@ def test_from_a_source_file_to_a_panel():
     pixels = grey(30, 40, np.uint16)
     source = read_source(F.tiff(pixels, tags=[(271, 2, b"ChemiDoc\0")]), file_name="blot.tif")
     core = {"sources": [source.to_json("s1")],
-            "blot": [{"id": "c1", "source": "s1", "source_channel": "gray", "invert": True, "contrast": [0, 65535]}],
+            "channels": [{"id": "c1", "drawn": True, "source": "s1", "source_channel": "gray", "invert": True,
+                          "contrast": [0, 65535]}],
+            "reference_channel": "c1",
             "orientation": {"turn": 0, "flip": False, "rotation": 1.5}, "output_bit_depth": 16}
     crop = default_crop(core)
-    png = new_panel(Content({"core": core, "figure": {"crop": crop}}, rendered=render(core, source.channels and
-                    {pixel_hash(i): i for i in source.channel_images}, crop),
-                    channel_images=source.channel_images, source_metadata=source.source_metadata), Tool("t", "1"))
+    png = new_panel(Content({"core": core, "figure": {"crop": crop}}, rendered=render(core, source.source_channels and
+                    {pixel_hash(i): i for i in source.source_channel_images}, crop),
+                    source_channel_images=source.source_channel_images, source_metadata=source.source_metadata), Tool("t", "1"))
     (panel,) = read(B.svg(B.data_uri(png))).panels
     assert not [n for n in panel.notices if n.kind in (Kind.BROKEN, Kind.DAMAGED, Kind.UNREADABLE)]
     key = core["sources"][0]["source_metadata"]
     assert panel.core.source_metadata[key]["index"]["byte_order"] == "II"
-    assert np.array_equal(next(iter(panel.channel_images.values())), pixels)
+    assert np.array_equal(next(iter(panel.source_channel_images.values())), pixels)
